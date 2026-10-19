@@ -186,6 +186,7 @@ remote.workspace = true
 repl.workspace = true
 reqwest = { workspace = true, features = ["multipart"] }
 reqwest_client.workspace = true
+review_canvas.workspace = true
 rope.workspace = true
 sandbox.workspace = true
 search.workspace = true

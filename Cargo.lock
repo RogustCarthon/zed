@@ -15333,6 +15333,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "review_canvas"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "fs",
+ "futures 0.3.34",
+ "futures-lite 2.6.1",
+ "git",
+ "gpui",
+ "language",
+ "multi_buffer",
+ "project",
+ "serde",
+ "serde_json",
+ "settings",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "which",
+ "workspace",
+]
+
+[[package]]
 name = "rfc6979"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22645,6 +22670,7 @@ dependencies = [
  "remote_server",
  "repl",
  "reqwest_client",
+ "review_canvas",
  "rope",
  "sandbox",
  "search",

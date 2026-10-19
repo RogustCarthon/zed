@@ -1,0 +1,191 @@
+{
+	"Dir": "/project/api",
+	"ImportPath": "example.com/shop/api",
+	"Module": {
+		"Path": "example.com/shop",
+		"Main": true,
+		"Dir": "/project",
+		"GoMod": "/project/go.mod",
+		"GoVersion": "1.25"
+	},
+	"GoFiles": [
+		"api.go"
+	],
+	"Imports": [
+		"encoding/json",
+		"example.com/shop/internal/inventory",
+		"example.com/shop/internal/notify",
+		"example.com/shop/internal/orders",
+		"example.com/shop/internal/payments",
+		"fmt",
+		"net/http"
+	]
+}
+{
+	"Dir": "/project/cmd/shop",
+	"ImportPath": "example.com/shop/cmd/shop",
+	"Module": {
+		"Path": "example.com/shop",
+		"Main": true,
+		"Dir": "/project",
+		"GoMod": "/project/go.mod",
+		"GoVersion": "1.25"
+	},
+	"GoFiles": [
+		"main.go"
+	],
+	"Imports": [
+		"example.com/shop/api",
+		"example.com/shop/internal/catalog",
+		"example.com/shop/internal/inventory",
+		"example.com/shop/internal/money",
+		"example.com/shop/internal/notify",
+		"log",
+		"net/http"
+	]
+}
+{
+	"Dir": "/project/internal/catalog",
+	"ImportPath": "example.com/shop/internal/catalog",
+	"Module": {
+		"Path": "example.com/shop",
+		"Main": true,
+		"Dir": "/project",
+		"GoMod": "/project/go.mod",
+		"GoVersion": "1.25"
+	},
+	"GoFiles": [
+		"catalog.go",
+		"category.go"
+	],
+	"Imports": [
+		"example.com/shop/internal/money",
+		"sort"
+	]
+}
+{
+	"Dir": "/project/internal/inventory",
+	"ImportPath": "example.com/shop/internal/inventory",
+	"Module": {
+		"Path": "example.com/shop",
+		"Main": true,
+		"Dir": "/project",
+		"GoMod": "/project/go.mod",
+		"GoVersion": "1.25"
+	},
+	"GoFiles": [
+		"inventory.go"
+	],
+	"Imports": [
+		"example.com/shop/internal/catalog",
+		"fmt"
+	]
+}
+{
+	"Dir": "/project/internal/money",
+	"ImportPath": "example.com/shop/internal/money",
+	"Module": {
+		"Path": "example.com/shop",
+		"Main": true,
+		"Dir": "/project",
+		"GoMod": "/project/go.mod",
+		"GoVersion": "1.25"
+	},
+	"GoFiles": [
+		"money.go"
+	],
+	"Imports": [
+		"fmt"
+	],
+	"TestGoFiles": [
+		"money_test.go"
+	]
+}
+{
+	"Dir": "/project/internal/notify",
+	"ImportPath": "example.com/shop/internal/notify",
+	"Module": {
+		"Path": "example.com/shop",
+		"Main": true,
+		"Dir": "/project",
+		"GoMod": "/project/go.mod",
+		"GoVersion": "1.25"
+	},
+	"GoFiles": [
+		"notify.go"
+	],
+	"Imports": [
+		"fmt",
+		"io",
+		"log"
+	]
+}
+{
+	"Dir": "/project/internal/orders",
+	"ImportPath": "example.com/shop/internal/orders",
+	"Module": {
+		"Path": "example.com/shop",
+		"Main": true,
+		"Dir": "/project",
+		"GoMod": "/project/go.mod",
+		"GoVersion": "1.25"
+	},
+	"GoFiles": [
+		"discount.go",
+		"discount_table_gen.go",
+		"orders.go"
+	],
+	"Imports": [
+		"example.com/shop/internal/inventory",
+		"example.com/shop/internal/money",
+		"example.com/shop/internal/pricing",
+		"fmt"
+	],
+	"TestGoFiles": [
+		"orders_test.go"
+	],
+	"XTestGoFiles": [
+		"orders_ext_test.go"
+	],
+	"XTestImports": [
+		"example.com/shop/internal/catalog",
+		"example.com/shop/internal/inventory",
+		"example.com/shop/internal/orders",
+		"testing"
+	]
+}
+{
+	"Dir": "/project/internal/payments",
+	"ImportPath": "example.com/shop/internal/payments",
+	"Module": {
+		"Path": "example.com/shop",
+		"Main": true,
+		"Dir": "/project",
+		"GoMod": "/project/go.mod",
+		"GoVersion": "1.25"
+	},
+	"GoFiles": [
+		"payments.go"
+	],
+	"Imports": [
+		"errors",
+		"example.com/shop/internal/money"
+	]
+}
+{
+	"Dir": "/project/internal/pricing",
+	"ImportPath": "example.com/shop/internal/pricing",
+	"Module": {
+		"Path": "example.com/shop",
+		"Main": true,
+		"Dir": "/project",
+		"GoMod": "/project/go.mod",
+		"GoVersion": "1.25"
+	},
+	"GoFiles": [
+		"pricing.go"
+	],
+	"Imports": [
+		"example.com/shop/internal/money"
+	]
+}
