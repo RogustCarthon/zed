@@ -126,6 +126,22 @@ enum AnalyzerForTests {
     Real,
 }
 
+/// A name for a node that stays the same when the model builds again with the same changes, for
+/// example after a reverse of the order: the file and the first row of the node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NodeKey {
+    path: String,
+    first_row: u32,
+}
+
+/// The item that the user picked. It stays until the user picks another item, also when the
+/// item goes out of the view, so that the user can follow its arrows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ActiveTarget {
+    Node(NodeKey),
+    Frame(SharedString),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum LoadState {
     Loading,
@@ -215,8 +231,8 @@ pub struct ReviewCanvas {
     wheel_zoom_accumulator: f32,
     pinch_zoom_accumulator: f32,
     painted_node_count: usize,
-    /// The frame that the user selected with a click. A focused node editor wins over this.
-    selected_frame: Option<SharedString>,
+    /// The node or frame that the user picked: with the focus in a node editor, or with a click.
+    active_target: Option<ActiveTarget>,
     /// The item whose arrows the last render highlighted.
     active: Option<Active>,
     _diff_list_subscription: Option<Subscription>,
@@ -266,7 +282,7 @@ impl ReviewCanvas {
             wheel_zoom_accumulator: 0.,
             pinch_zoom_accumulator: 0.,
             painted_node_count: 0,
-            selected_frame: None,
+            active_target: None,
             active: None,
             _diff_list_subscription: None,
             _open_task: open_task,
@@ -857,7 +873,7 @@ impl ReviewCanvas {
     fn render_background_layer(
         &self,
         arrows: Vec<Arrow>,
-        node_targets: Vec<(Bounds<Pixels>, Option<SharedString>)>,
+        node_targets: Vec<(Bounds<Pixels>, Option<NodeKey>)>,
         frame_targets: Vec<(Bounds<Pixels>, SharedString)>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -927,27 +943,29 @@ impl ReviewCanvas {
                             return;
                         }
                         let local_position = event.position - bounds.origin;
-                        if let Some((_, frame)) = node_targets
+                        if let Some((_, key)) = node_targets
                             .iter()
                             .find(|(node_bounds, _)| node_bounds.contains(&local_position))
                         {
-                            // The node editor handles the click. Its frame becomes the
-                            // selection, so that it stays active after the editor loses focus.
-                            let frame = frame.clone();
+                            // The node editor handles the click itself. The node becomes the
+                            // active item.
+                            let target = key.clone().map(ActiveTarget::Node);
                             this.update(cx, |this, cx| {
-                                this.selected_frame = frame;
+                                this.active_target = target;
                                 cx.notify();
                             })
                             .log_err();
                             return;
                         }
-                        let frame = frame_targets
+                        // A click on a frame selects the frame. A click on the empty canvas
+                        // clears the active item.
+                        let target = frame_targets
                             .iter()
                             .find(|(frame_bounds, _)| frame_bounds.contains(&local_position))
-                            .map(|(_, title)| title.clone());
+                            .map(|(_, title)| ActiveTarget::Frame(title.clone()));
                         focus_handle.focus(window, cx);
                         this.update(cx, |this, cx| {
-                            this.selected_frame = frame;
+                            this.active_target = target;
                             this.drag = Some(DragState {
                                 start_position: event.position,
                                 start_origin: this.camera.origin,
@@ -1186,18 +1204,22 @@ impl ReviewCanvas {
             .into_any_element()
     }
 
-    fn compute_active(&self, window: &Window, cx: &App) -> Option<Active> {
-        if let Some(node) = self
-            .nodes
-            .iter()
-            .position(|node| node.editor.focus_handle(cx).contains_focused(window, cx))
-        {
-            return Some(Active::Node(node));
+    fn node_key(&self, node: usize) -> Option<NodeKey> {
+        let model_node = self.model.nodes.get(node)?;
+        let file = self.files.get(model_node.file)?;
+        Some(NodeKey {
+            path: file.info.path.clone(),
+            first_row: model_node.parts.first().map_or(0, |part| part.rows.start),
+        })
+    }
+
+    fn resolve_active(&self) -> Option<Active> {
+        match self.active_target.as_ref()? {
+            ActiveTarget::Node(key) => (0..self.model.nodes.len())
+                .find(|node| self.node_key(*node).as_ref() == Some(key))
+                .map(Active::Node),
+            ActiveTarget::Frame(title) => self.model.frame_with_title(title).map(Active::Frame),
         }
-        self.selected_frame
-            .as_deref()
-            .and_then(|title| self.model.frame_with_title(title))
-            .map(Active::Frame)
     }
 
     fn relation_color(relation: Relation, cx: &App) -> Option<Hsla> {
@@ -1214,7 +1236,14 @@ impl ReviewCanvas {
         let viewport_size = self.viewport.get().size;
         let culling_bounds = Bounds::new(Point::default(), viewport_size).dilate(CULLING_MARGIN);
         let low_detail = self.screen_font_size(cx) < LOW_DETAIL_FONT_SIZE;
-        self.active = self.compute_active(window, cx);
+        let focused_node = self
+            .nodes
+            .iter()
+            .position(|node| node.editor.focus_handle(cx).contains_focused(window, cx));
+        if let Some(key) = focused_node.and_then(|node| self.node_key(node)) {
+            self.active_target = Some(ActiveTarget::Node(key));
+        }
+        self.active = self.resolve_active();
         let frame_relations = self.model.frame_relations(self.active);
         let node_relations = self.model.node_relations(self.active);
         let edge_relations = self.model.edge_relations(self.active);
@@ -1225,10 +1254,14 @@ impl ReviewCanvas {
         let frame_bounds: Vec<Bounds<Pixels>> = layout.frame_bounds.iter().map(to_local).collect();
         let other_files_bounds = layout.other_files_bounds.as_ref().map(to_local);
 
+        // The focused node renders also outside the view. GPUI moves the focus away from an
+        // editor that is not in the window any more, and the user would lose the cursor.
         let visible_nodes: Vec<usize> = node_bounds
             .iter()
             .enumerate()
-            .filter(|(_, bounds)| bounds.intersects(&culling_bounds))
+            .filter(|(index, bounds)| {
+                bounds.intersects(&culling_bounds) || focused_node == Some(*index)
+            })
             .map(|(index, _)| index)
             .collect();
         self.painted_node_count = visible_nodes.len();
@@ -1274,16 +1307,9 @@ impl ReviewCanvas {
             })
             .partition(|arrow| arrow.emphasized);
 
-        let node_targets: Vec<(Bounds<Pixels>, Option<SharedString>)> = visible_nodes
+        let node_targets: Vec<(Bounds<Pixels>, Option<NodeKey>)> = visible_nodes
             .iter()
-            .filter_map(|index| {
-                let frame = self
-                    .model
-                    .frame_of_node(*index)
-                    .and_then(|frame| self.model.frames.get(frame))
-                    .map(|frame| frame.title.clone());
-                Some((*node_bounds.get(*index)?, frame))
-            })
+            .filter_map(|index| Some((*node_bounds.get(*index)?, self.node_key(*index))))
             .collect();
         let frame_targets: Vec<(Bounds<Pixels>, SharedString)> = self
             .model
@@ -1910,6 +1936,31 @@ mod tests {
             );
         });
 
+        // The active node stays active and keeps the focus when it goes out of the view.
+        review_canvas.update(cx, |review_canvas, cx| {
+            review_canvas.camera.origin = point(px(100_000.), px(100_000.));
+            cx.notify();
+        });
+        draw(cx);
+        review_canvas.read_with(cx, |review_canvas, _| {
+            assert_eq!(
+                active_title(review_canvas).as_deref(),
+                Some("internal/catalog")
+            );
+            assert_eq!(
+                review_canvas.painted_node_count, 1,
+                "only the focused node renders"
+            );
+        });
+        assert!(
+            cx.update(|window, cx| catalog_editor.focus_handle(cx).contains_focused(window, cx))
+        );
+        review_canvas.update(cx, |review_canvas, cx| {
+            review_canvas.camera.origin = INITIAL_CAMERA_ORIGIN;
+            cx.notify();
+        });
+        draw(cx);
+
         cx.dispatch_action(ReverseOrder);
         draw(cx);
         review_canvas.read_with(cx, |review_canvas, _| {
@@ -1938,10 +1989,22 @@ mod tests {
             );
         });
 
-        // Without a focused node, the frame that the user selected is active.
+        // A selected frame is active, also out of the view.
         review_canvas.update_in(cx, |review_canvas, window, cx| {
             review_canvas.focus_handle.focus(window, cx);
-            review_canvas.selected_frame = Some("internal/money".into());
+            review_canvas.active_target = Some(ActiveTarget::Frame("internal/money".into()));
+            review_canvas.camera.origin = point(px(100_000.), px(100_000.));
+        });
+        draw(cx);
+        review_canvas.read_with(cx, |review_canvas, _| {
+            assert_eq!(
+                active_title(review_canvas).as_deref(),
+                Some("internal/money")
+            );
+        });
+        review_canvas.update(cx, |review_canvas, cx| {
+            review_canvas.camera.origin = INITIAL_CAMERA_ORIGIN;
+            cx.notify();
         });
         draw(cx);
         review_canvas.read_with(cx, |review_canvas, _| {
@@ -1956,7 +2019,7 @@ mod tests {
         });
 
         review_canvas.update(cx, |review_canvas, cx| {
-            review_canvas.selected_frame = None;
+            review_canvas.active_target = None;
             cx.notify();
         });
         draw(cx);
