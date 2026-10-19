@@ -24,18 +24,20 @@ use editor::{
 use futures::{FutureExt as _, StreamExt as _, future::Shared, stream};
 use futures_lite::future::yield_now;
 use git::{repository::RepoPath, status::FileStatus};
+use git_ui::branch_picker::{self, SelectBranchCallback};
 use gpui::{
-    App, AppContext as _, AsyncWindowContext, Bounds, Context, DispatchPhase, Entity, EventEmitter,
-    FocusHandle, Focusable, FontWeight, HitboxBehavior, Hsla, KeyBinding, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, PinchEvent, Pixels, Point, Render,
-    ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Task, TextStyleRefinement,
-    WeakEntity, Window, actions, canvas, fill, point, px, size,
+    Anchor, App, AppContext as _, AsyncWindowContext, Bounds, Context, DispatchPhase, Entity,
+    EventEmitter, FocusHandle, Focusable, FontWeight, HitboxBehavior, Hsla, KeyBinding,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, PinchEvent, Pixels,
+    Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Task,
+    TextStyleRefinement, WeakEntity, Window, actions, canvas, fill, point, px, size,
 };
 use language::{Buffer, Capability, OffsetRangeExt as _, language_settings::SoftWrap};
 use multi_buffer::{MultiBuffer, MultiBufferRow, PathKey};
 use package_graph::{GO_LIST_JSON_FIELDS, GoPackages};
 use project::{
     Project,
+    git_store::Repository,
     git_store::diff_buffer_list::{BranchDiffEvent, DiffBase, DiffBufferList, LoadedDiffBuffer},
 };
 use review_model::{
@@ -45,9 +47,9 @@ use review_model::{
 use settings::Settings as _;
 use symbol_graph::{ANALYZER_SOURCES, SymbolGraph};
 use theme_settings::ThemeSettings;
-use ui::{Button, Icon, IconName, LabelSize, prelude::*};
+use ui::{Button, Icon, IconName, IconSize, LabelSize, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
-use workspace::{Item, Workspace};
+use workspace::{Item, Workspace, item::ItemEvent};
 
 actions!(
     review_canvas,
@@ -202,6 +204,8 @@ struct DragState {
 pub struct ReviewCanvas {
     focus_handle: FocusHandle,
     project: Entity<Project>,
+    workspace: WeakEntity<Workspace>,
+    repository: Option<Entity<Repository>>,
     base_ref: Option<SharedString>,
     repository_root: Option<Arc<Path>>,
     diff_list: Option<Entity<DiffBufferList>>,
@@ -243,11 +247,17 @@ pub struct ReviewCanvas {
 impl ReviewCanvas {
     fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
         let project = workspace.project().clone();
-        let review_canvas = cx.new(|cx| ReviewCanvas::new(project, window, cx));
+        let workspace_handle = workspace.weak_handle();
+        let review_canvas = cx.new(|cx| ReviewCanvas::new(project, workspace_handle, window, cx));
         workspace.add_item_to_active_pane(Box::new(review_canvas), None, true, window, cx);
     }
 
-    fn new(project: Entity<Project>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        project: Entity<Project>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let open_task = cx.spawn_in(window, async move |this, cx| {
             if let Err(error) = Self::start_loading(this.clone(), cx).await {
                 this.update(cx, |this, cx| this.fail(error, cx)).log_err();
@@ -257,6 +267,8 @@ impl ReviewCanvas {
         Self {
             focus_handle: cx.focus_handle(),
             project,
+            workspace,
+            repository: None,
             base_ref: None,
             repository_root: None,
             diff_list: None,
@@ -309,6 +321,7 @@ impl ReviewCanvas {
 
         this.update_in(cx, |this, window, cx| {
             this.repository_root = Some(repository.read(cx).snapshot().work_directory_abs_path);
+            this.repository = Some(repository.clone());
             let git_store = this.project.read(cx).git_store().clone();
             let diff_list = cx.new(|cx| {
                 DiffBufferList::new(
@@ -331,8 +344,71 @@ impl ReviewCanvas {
             ));
             this.base_ref = Some(base_ref);
             this.diff_list = Some(diff_list);
+            cx.emit(ItemEvent::UpdateTab);
             cx.notify();
         })
+    }
+
+    /// Compares the branch with another base branch. The canvas loads again.
+    fn set_base_ref(&mut self, base_ref: SharedString, cx: &mut Context<Self>) {
+        if self.base_ref.as_ref() == Some(&base_ref) {
+            return;
+        }
+        let Some(diff_list) = self.diff_list.clone() else {
+            return;
+        };
+        self.base_ref = Some(base_ref.clone());
+        self.load_state = LoadState::Loading;
+        self.active_target = None;
+        self.camera.origin = INITIAL_CAMERA_ORIGIN;
+        // The list emits `DiffBaseChanged` and then `FileListChanged`, and both refresh the
+        // canvas.
+        diff_list.update(cx, |diff_list, cx| {
+            diff_list.set_diff_base(DiffBase::Merge { base_ref }, cx)
+        });
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    fn render_base_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = match &self.base_ref {
+            Some(base_ref) => format!("Base: {base_ref}"),
+            None => "Base: …".to_string(),
+        };
+        let this = cx.weak_entity();
+        let workspace = self.workspace.clone();
+        let repository = self.repository.clone();
+        let selected = self.base_ref.clone();
+        PopoverMenu::new("review-canvas-base-branch")
+            .menu(move |window, cx| {
+                let this = this.clone();
+                let on_select: SelectBranchCallback = Arc::new(move |branch, _window, cx| {
+                    let base_ref: SharedString = branch.name().to_owned().into();
+                    this.update(cx, |this, cx| this.set_base_ref(base_ref, cx))
+                        .log_err();
+                });
+                Some(branch_picker::select_popover(
+                    workspace.clone(),
+                    repository.clone(),
+                    selected.clone(),
+                    on_select,
+                    window,
+                    cx,
+                ))
+            })
+            // The status bar is at the bottom of the canvas, so the menu opens upward.
+            .anchor(Anchor::BottomRight)
+            .attach(Anchor::TopRight)
+            .trigger_with_tooltip(
+                Button::new("review-canvas-base-branch-button", label)
+                    .label_size(LabelSize::XSmall)
+                    .end_icon(
+                        Icon::new(IconName::ChevronDown)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                Tooltip::text("Select the base branch"),
+            )
     }
 
     fn fail(&mut self, error: anyhow::Error, cx: &mut Context<Self>) {
@@ -1156,6 +1232,7 @@ impl ReviewCanvas {
                         self.painted_node_count,
                         self.nodes.len(),
                     ))
+                    .child(self.render_base_picker(cx))
                     .child(
                         Button::new("reverse-order", "Reverse order")
                             .label_size(LabelSize::XSmall)
@@ -1446,7 +1523,7 @@ impl Render for ReviewCanvas {
     }
 }
 
-impl EventEmitter<()> for ReviewCanvas {}
+impl EventEmitter<ItemEvent> for ReviewCanvas {}
 
 impl Focusable for ReviewCanvas {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -1455,7 +1532,11 @@ impl Focusable for ReviewCanvas {
 }
 
 impl Item for ReviewCanvas {
-    type Event = ();
+    type Event = ItemEvent;
+
+    fn to_item_events(event: &ItemEvent, f: &mut dyn FnMut(ItemEvent)) {
+        f(*event)
+    }
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
         match &self.base_ref {
@@ -1742,6 +1823,34 @@ mod tests {
         let first_editor =
             review_canvas.read_with(cx, |review_canvas, _| review_canvas.nodes[0].editor.clone());
         editor::test::editor_test_context::assert_state_with_diff(&first_editor, cx, "- ˇA\n+ C");
+
+        // Another base branch loads the canvas again.
+        review_canvas.update(cx, |review_canvas, cx| {
+            review_canvas.set_base_ref("origin/release".into(), cx)
+        });
+        review_canvas.read_with(cx, |review_canvas, _| {
+            assert_eq!(review_canvas.load_state, LoadState::Loading);
+        });
+        draw(cx);
+        review_canvas.read_with(cx, |review_canvas, cx| {
+            assert_eq!(review_canvas.load_state, LoadState::Ready);
+            assert_eq!(review_canvas.base_ref.as_deref(), Some("origin/release"));
+            assert_eq!(
+                review_canvas.tab_content_text(0, cx),
+                "Review since origin/release"
+            );
+            let diff_base = review_canvas
+                .diff_list
+                .as_ref()
+                .map(|diff_list| diff_list.read(cx).diff_base().clone());
+            assert_eq!(
+                diff_base,
+                Some(DiffBase::Merge {
+                    base_ref: "origin/release".into()
+                })
+            );
+        });
+        assert_eq!(node_paths(&review_canvas, cx), ["a.txt", "b.txt", "d.txt"]);
     }
 
     #[gpui::test]
