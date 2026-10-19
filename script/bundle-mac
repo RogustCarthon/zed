@@ -55,6 +55,8 @@ shift $((OPTIND-1))
 
 if [ "$runtime_shaders" = true ]; then
     zed_features="${zed_features} --features gpui_platform/runtime_shaders"
+    # remote_server builds in its own invocation, and it also depends on gpui_platform.
+    remote_server_features="${remote_server_features} --features gpui_platform/runtime_shaders"
 fi
 
 
