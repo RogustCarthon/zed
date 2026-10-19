@@ -6,6 +6,8 @@ use std::{
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
 
+use crate::graph;
+
 /// The fields of `go list -json` that the review canvas reads.
 pub(crate) const GO_LIST_JSON_FIELDS: &str =
     "ImportPath,Dir,Module,GoFiles,CgoFiles,TestGoFiles,XTestGoFiles,Imports,XTestImports";
@@ -48,6 +50,17 @@ pub(crate) struct GoPackage {
     dir: PathBuf,
     files: BTreeSet<String>,
     imports: Vec<String>,
+}
+
+impl GoPackage {
+    /// The path that `go` loads. An external test package loads with the path of its package.
+    pub fn import_path(&self) -> &str {
+        if self.is_external_test {
+            self.id.strip_suffix("_test").unwrap_or(&self.id)
+        } else {
+            &self.id
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -116,12 +129,7 @@ impl GoPackages {
     /// through packages that are not in `changed`. Edges that a longer path already gives are
     /// removed (transitive reduction), so the canvas shows fewer arrows.
     pub fn reduced_edges(&self, changed: &BTreeSet<String>) -> Vec<(String, String)> {
-        let imports: BTreeMap<&str, &[String]> = self
-            .packages
-            .iter()
-            .map(|package| (package.id.as_str(), package.imports.as_slice()))
-            .collect();
-
+        let imports = self.imports_by_id();
         let reachable: BTreeMap<&str, BTreeSet<&str>> = changed
             .iter()
             .map(|package| {
@@ -131,21 +139,47 @@ impl GoPackages {
             })
             .collect();
 
-        let mut edges = Vec::new();
-        for (user, dependencies) in &reachable {
-            for dependency in dependencies {
-                let has_longer_path = dependencies.iter().any(|middle| {
-                    middle != dependency
-                        && reachable
-                            .get(middle)
-                            .is_some_and(|reachable| reachable.contains(dependency))
-                });
-                if !has_longer_path {
-                    edges.push((user.to_string(), dependency.to_string()));
-                }
-            }
-        }
-        edges
+        graph::transitive_reduction(&reachable)
+            .into_iter()
+            .map(|(user, dependency)| (user.to_string(), dependency.to_string()))
+            .collect()
+    }
+
+    /// Returns the import paths that the symbol analyzer must load: the given packages, and the
+    /// packages on an import path between two of them. Without the packages between, the analyzer
+    /// cannot see that a changed declaration reaches another one through unchanged code.
+    pub fn analysis_import_paths(&self, changed: &BTreeSet<String>) -> BTreeSet<String> {
+        let imports = self.imports_by_id();
+        let reachable: BTreeMap<&str, BTreeSet<&str>> = imports
+            .keys()
+            .map(|package| (*package, reachable_packages(package, &imports)))
+            .collect();
+        self.packages
+            .iter()
+            .filter(|package| {
+                changed.contains(&package.id)
+                    || (reachable
+                        .get(package.id.as_str())
+                        .is_some_and(|dependencies| {
+                            dependencies
+                                .iter()
+                                .any(|dependency| changed.contains(*dependency))
+                        })
+                        && changed.iter().any(|user| {
+                            reachable.get(user.as_str()).is_some_and(|dependencies| {
+                                dependencies.contains(package.id.as_str())
+                            })
+                        }))
+            })
+            .map(|package| package.import_path().to_string())
+            .collect()
+    }
+
+    fn imports_by_id(&self) -> BTreeMap<&str, &[String]> {
+        self.packages
+            .iter()
+            .map(|package| (package.id.as_str(), package.imports.as_slice()))
+            .collect()
     }
 }
 
@@ -173,55 +207,12 @@ fn reachable_packages<'a>(
     reachable
 }
 
-/// Returns the column of each package: the number of edges on the longest dependency path
-/// from the package to a package with no dependencies.
+/// Returns the column of each package, see [`graph::columns`].
 pub(crate) fn columns(
     packages: &BTreeSet<String>,
     edges: &[(String, String)],
 ) -> BTreeMap<String, usize> {
-    let mut dependencies: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for (user, dependency) in edges {
-        dependencies
-            .entry(user.as_str())
-            .or_default()
-            .push(dependency.as_str());
-    }
-
-    fn column_of<'a>(
-        package: &'a str,
-        dependencies: &BTreeMap<&'a str, Vec<&'a str>>,
-        columns: &mut BTreeMap<&'a str, usize>,
-        visiting: &mut BTreeSet<&'a str>,
-    ) -> usize {
-        if let Some(column) = columns.get(package) {
-            return *column;
-        }
-        // Go does not permit import cycles. This guard only stops a bad graph from recursing
-        // forever.
-        if !visiting.insert(package) {
-            return 0;
-        }
-        let column = dependencies
-            .get(package)
-            .into_iter()
-            .flatten()
-            .map(|dependency| column_of(dependency, dependencies, columns, visiting) + 1)
-            .max()
-            .unwrap_or(0);
-        visiting.remove(package);
-        columns.insert(package, column);
-        column
-    }
-
-    let mut columns = BTreeMap::new();
-    let mut visiting = BTreeSet::new();
-    for package in packages {
-        column_of(package, &dependencies, &mut columns, &mut visiting);
-    }
-    columns
-        .into_iter()
-        .map(|(package, column)| (package.to_string(), column))
-        .collect()
+    graph::columns(packages, edges)
 }
 
 #[cfg(test)]
@@ -330,13 +321,24 @@ mod tests {
     }
 
     #[test]
-    fn test_columns_survive_a_cycle() {
-        let packages: BTreeSet<String> = ["a", "b"].into_iter().map(String::from).collect();
-        let edges = vec![
-            ("a".to_string(), "b".to_string()),
-            ("b".to_string(), "a".to_string()),
-        ];
-        let columns = columns(&packages, &edges);
-        assert_eq!(columns.len(), 2);
+    fn test_analysis_includes_unchanged_packages_between_changed_ones() {
+        let changed: BTreeSet<String> = ["internal/orders", "internal/catalog"]
+            .into_iter()
+            .map(id)
+            .collect();
+        let paths = shop_packages().analysis_import_paths(&changed);
+        let expected: BTreeSet<String> =
+            ["internal/catalog", "internal/inventory", "internal/orders"]
+                .into_iter()
+                .map(id)
+                .collect();
+        assert_eq!(paths, expected);
+
+        // An external test package loads with the path of its package.
+        let changed = BTreeSet::from([id("internal/orders_test")]);
+        assert_eq!(
+            shop_packages().analysis_import_paths(&changed),
+            BTreeSet::from([id("internal/orders")])
+        );
     }
 }

@@ -1,33 +1,42 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
+    ops::Range,
     path::{Path, PathBuf},
 };
 
 use gpui::{Bounds, Pixels, SharedString, point, px, size};
 
-use crate::package_graph::{self, GoPackages};
+use crate::{
+    graph,
+    package_graph::{self, GoPackages},
+    symbol_graph::SymbolGraph,
+};
 
 pub(crate) const NODE_WIDTH: Pixels = px(760.);
 pub(crate) const NODE_HEADER_HEIGHT: Pixels = px(28.);
 pub(crate) const FRAME_HEADER_HEIGHT: Pixels = px(36.);
 const FRAME_PADDING: Pixels = px(16.);
 const NODE_GAP: Pixels = px(24.);
+const SUB_COLUMN_GAP: Pixels = px(96.);
 const FRAME_GAP: Pixels = px(56.);
 const COLUMN_GAP: Pixels = px(200.);
 const OTHER_FILES_GAP: Pixels = px(120.);
 const BARYCENTER_SWEEPS: usize = 4;
 
-/// What the review model needs to know about one changed file.
+/// One changed file and the head rows of its change blocks.
 #[derive(Debug, Clone)]
-pub(crate) struct NodeInfo {
+pub(crate) struct ChangedFile {
     /// Path relative to the repository root, with `/` separators.
     pub path: String,
     pub abs_path: PathBuf,
     pub is_generated: bool,
+    /// The head rows of each change block (0-based, `end` exclusive), in file order. An empty
+    /// range is a deletion.
+    pub change_blocks: Vec<Range<u32>>,
 }
 
-impl NodeInfo {
+impl ChangedFile {
     pub fn is_go(&self) -> bool {
         self.path.ends_with(".go")
     }
@@ -55,180 +64,445 @@ impl ReviewOrder {
     }
 }
 
+/// A part of a change block. A change block that covers more than one declaration splits into
+/// parts, and each part can be in a different node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockPart {
+    pub change_block: usize,
+    pub rows: Range<u32>,
+}
+
+impl BlockPart {
+    fn sort_key(&self) -> (u32, u32, usize) {
+        (self.rows.start, self.rows.end, self.change_block)
+    }
+}
+
+/// Parts sort in file order.
+impl Ord for BlockPart {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.sort_key().cmp(&other.sort_key())
+    }
+}
+
+impl PartialOrd for BlockPart {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ModelNode {
+    pub file: usize,
+    /// In file order.
+    pub parts: Vec<BlockPart>,
+    /// The names of the declarations in the node, for display.
+    pub declarations: Vec<SharedString>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Frame {
     pub title: SharedString,
     pub column: usize,
-    /// Node indexes, in review order.
-    pub nodes: Vec<usize>,
+    /// Node indexes of each sub-column, top to bottom. Sub-columns go left to right.
+    pub sub_columns: Vec<Vec<usize>>,
 }
 
-/// An arrow between two frames. Arrows point in the review order, from left to right.
+impl Frame {
+    /// Node indexes in review order: sub-column by sub-column, top to bottom.
+    pub fn nodes(&self) -> impl Iterator<Item = usize> + '_ {
+        self.sub_columns.iter().flatten().copied()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Endpoint {
+    Node(usize),
+    /// Only when there is no symbol graph: the arrows connect package frames.
+    Frame(usize),
+}
+
+/// An arrow. Arrows point in the review order, from left to right.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FrameEdge {
-    pub from: usize,
-    pub to: usize,
-    /// The frame that uses the other frame. This does not change with the review order.
-    pub user: usize,
-    pub dependency: usize,
+pub(crate) struct ModelEdge {
+    pub from: Endpoint,
+    pub to: Endpoint,
+    /// The end that uses the other end. This does not change with the review order.
+    pub user: Endpoint,
+    pub dependency: Endpoint,
 }
 
-/// How a frame or an arrow relates to the active frame.
+/// The item that the user looks at: the node with the focused editor, or a selected frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Active {
+    Node(usize),
+    Frame(usize),
+}
+
+/// How a frame, a node, or an arrow relates to the active item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Relation {
-    /// There is no active frame, or this item does not touch it.
+    /// There is no active item, or this item does not touch it.
     Unrelated,
-    /// The active frame itself.
+    /// The active item itself, or an arrow inside the active frame.
     Active,
-    /// A package that the active frame uses, or the arrow to it.
+    /// Something that the active item uses, or the arrow to it.
     Dependency,
-    /// A package that uses the active frame, or the arrow from it.
+    /// Something that uses the active item, or the arrow from it.
     User,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct ReviewModel {
+    /// Sorted by file and first row, so that the same changes give the same nodes in both review
+    /// orders. The canvas keeps one editor for each node.
+    pub nodes: Vec<ModelNode>,
     /// Frames in review order: column by column, and top to bottom in a column.
     pub frames: Vec<Frame>,
-    pub edges: Vec<FrameEdge>,
-    /// Node indexes of the files that are not Go, in path order.
+    pub edges: Vec<ModelEdge>,
+    /// Nodes of the files that are not Go, in path order.
     pub other_files: Vec<usize>,
 }
 
+/// A group of change block parts that moves as one in the layout: the parts of one symbol unit
+/// (one declaration, or declarations that use each other), or the parts of a file outside all
+/// declarations.
+#[derive(Debug, Default)]
+struct Item {
+    frame_key: String,
+    /// `(file, part)` pairs.
+    parts: Vec<(usize, BlockPart)>,
+    /// `(file, start line, name)` of each declaration.
+    declarations: Vec<(usize, u32, String)>,
+}
+
+/// Where a node goes: `(frame, sub-column, file)`. Other files have no placement.
+type Placement = (usize, usize, usize);
+
 impl ReviewModel {
-    /// Groups the nodes into package frames and orders them.
+    /// Builds the frames, nodes, and edges.
     ///
-    /// Without `packages` (for example, when `go list` fails), each directory with Go changes
-    /// becomes a frame, and there are no edges.
+    /// With `symbols`, nodes hold the changed declarations of one file in one sub-column of a
+    /// frame, and the edges connect nodes. Without `symbols`, each file is one node, and the
+    /// edges connect package frames. Without `packages` (for example, when `go list` fails),
+    /// each directory with Go changes is a frame, and there are no edges.
     pub fn build(
-        nodes: &[NodeInfo],
+        files: &[ChangedFile],
         packages: Option<&GoPackages>,
+        symbols: Option<&SymbolGraph>,
         repository_root: &Path,
         order: ReviewOrder,
     ) -> Self {
-        let mut other_files: Vec<usize> = Vec::new();
-        // Frame key -> (title, is a package that `go list` knows, node indexes)
-        let mut frames_by_key: BTreeMap<String, (String, bool, Vec<usize>)> = BTreeMap::new();
-        for (index, node) in nodes.iter().enumerate() {
-            if !node.is_go() {
-                other_files.push(index);
+        // Frame key -> (title, is a package that `go list` knows).
+        let mut frame_info: BTreeMap<String, (String, bool)> = BTreeMap::new();
+        let mut frame_key_of_file: BTreeMap<usize, String> = BTreeMap::new();
+        for (index, file) in files.iter().enumerate() {
+            if !file.is_go() {
                 continue;
             }
             let (key, title, is_package) =
-                match packages.and_then(|packages| packages.package_for_file(&node.abs_path)) {
+                match packages.and_then(|packages| packages.package_for_file(&file.abs_path)) {
                     Some(package) => (package.id.clone(), package.name.clone(), true),
                     None => {
-                        let directory = node
-                            .abs_path
-                            .parent()
-                            .and_then(|parent| parent.strip_prefix(repository_root).ok())
-                            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-                            .filter(|relative| !relative.is_empty())
-                            .unwrap_or_else(|| ".".to_string());
+                        let directory = directory_title(&file.abs_path, repository_root);
                         (format!("directory:{directory}"), directory, false)
                     }
                 };
-            frames_by_key
-                .entry(key)
-                .or_insert_with(|| (title, is_package, Vec::new()))
-                .2
-                .push(index);
+            frame_info.entry(key.clone()).or_insert((title, is_package));
+            frame_key_of_file.insert(index, key);
         }
-        other_files.sort_by(|left, right| nodes[*left].path.cmp(&nodes[*right].path));
 
-        let changed_packages: BTreeSet<String> = frames_by_key
+        let (items, item_edges) = match symbols {
+            Some(symbols) => symbol_items(files, &frame_key_of_file, symbols),
+            None => (file_items(files, &frame_key_of_file), Vec::new()),
+        };
+
+        // Package columns.
+        let changed_packages: BTreeSet<String> = frame_info
             .iter()
-            .filter(|(_, (_, is_package, _))| *is_package)
+            .filter(|(_, (_, is_package))| *is_package)
             .map(|(key, _)| key.clone())
             .collect();
         let package_edges = packages
             .map(|packages| packages.reduced_edges(&changed_packages))
             .unwrap_or_default();
-        let frame_keys: BTreeSet<String> = frames_by_key.keys().cloned().collect();
-        let dependency_columns = package_graph::columns(&frame_keys, &package_edges);
+        let frame_keys: Vec<String> = frame_info.keys().cloned().collect();
+        let frame_key_set: BTreeSet<String> = frame_keys.iter().cloned().collect();
+        let dependency_columns = package_graph::columns(&frame_key_set, &package_edges);
         let last_column = dependency_columns.values().copied().max().unwrap_or(0);
-
-        let keys: Vec<String> = frames_by_key.keys().cloned().collect();
-        let index_of_key: BTreeMap<&str, usize> = keys
+        let frame_columns: Vec<usize> = frame_keys
+            .iter()
+            .map(|key| {
+                let column = dependency_columns.get(key).copied().unwrap_or(0);
+                match order {
+                    ReviewOrder::BottomUp => column,
+                    ReviewOrder::TopDown => last_column - column,
+                }
+            })
+            .collect();
+        let frame_of_key: BTreeMap<&str, usize> = frame_keys
             .iter()
             .enumerate()
             .map(|(index, key)| (key.as_str(), index))
             .collect();
-        let mut frames: Vec<Frame> = frames_by_key
-            .into_iter()
-            .map(|(key, (title, _, mut node_indexes))| {
-                // Non-test files first, then tests, then generated files. Each group is in
-                // path order.
-                node_indexes.sort_by(|left, right| {
-                    let (left, right) = (&nodes[*left], &nodes[*right]);
-                    (left.is_generated, left.is_test(), &left.path).cmp(&(
-                        right.is_generated,
-                        right.is_test(),
-                        &right.path,
-                    ))
-                });
-                let dependency_column = dependency_columns.get(&key).copied().unwrap_or(0);
-                Frame {
-                    title: title.into(),
-                    column: match order {
-                        ReviewOrder::BottomUp => dependency_column,
-                        ReviewOrder::TopDown => last_column - dependency_column,
-                    },
-                    nodes: node_indexes,
-                }
-            })
-            .collect();
 
-        let edges: Vec<(usize, usize)> = package_edges
-            .iter()
-            .filter_map(|(user, dependency)| {
-                Some((
-                    *index_of_key.get(user.as_str())?,
-                    *index_of_key.get(dependency.as_str())?,
-                ))
-            })
-            .collect();
-
-        let rows = barycenter_rows(&frames, &edges);
-        let mut frame_order: Vec<usize> = (0..frames.len()).collect();
-        frame_order.sort_by(|left, right| {
-            (frames[*left].column, rows[*left])
-                .partial_cmp(&(frames[*right].column, rows[*right]))
-                .unwrap_or(Ordering::Equal)
-        });
-        let mut new_index = vec![0; frames.len()];
-        for (new, old) in frame_order.iter().enumerate() {
-            new_index[*old] = new;
-        }
-
-        let mut edges: Vec<FrameEdge> = edges
-            .into_iter()
-            .map(|(user, dependency)| {
-                let (user, dependency) = (new_index[user], new_index[dependency]);
-                let (from, to) = match order {
-                    ReviewOrder::BottomUp => (dependency, user),
-                    ReviewOrder::TopDown => (user, dependency),
+        // Sub-columns of the items in their frame, from the edges inside the frame.
+        let mut item_sub_column = vec![0; items.len()];
+        for frame_key in &frame_keys {
+            let frame_items: BTreeSet<usize> = (0..items.len())
+                .filter(|item| items[*item].frame_key == *frame_key)
+                .collect();
+            let inner_edges: Vec<(usize, usize)> = item_edges
+                .iter()
+                .filter(|(user, dependency)| {
+                    frame_items.contains(user) && frame_items.contains(dependency)
+                })
+                .copied()
+                .collect();
+            let columns = graph::columns(&frame_items, &inner_edges);
+            let last = columns.values().copied().max().unwrap_or(0);
+            for (item, column) in columns {
+                item_sub_column[item] = match order {
+                    ReviewOrder::BottomUp => column,
+                    ReviewOrder::TopDown => last - column,
                 };
-                FrameEdge {
-                    from,
-                    to,
-                    user,
-                    dependency,
-                }
-            })
-            .collect();
-        edges.sort_by_key(|edge| (edge.from, edge.to));
-
-        let mut ordered_frames = Vec::with_capacity(frames.len());
-        let mut frames: Vec<Option<Frame>> = frames.drain(..).map(Some).collect();
-        for old in frame_order {
-            if let Some(frame) = frames.get_mut(old).and_then(Option::take) {
-                ordered_frames.push(frame);
             }
         }
 
+        // Nodes: the items of one file in one frame and one sub-column. The grouping does not
+        // depend on the review order, because mirroring keeps the partition.
+        let mut groups: BTreeMap<Placement, (Vec<BlockPart>, Vec<(u32, String)>)> = BTreeMap::new();
+        let mut item_groups: Vec<BTreeSet<Placement>> = vec![BTreeSet::new(); items.len()];
+        for (index, item) in items.iter().enumerate() {
+            let frame = frame_of_key
+                .get(item.frame_key.as_str())
+                .copied()
+                .unwrap_or(0);
+            for (file, part) in &item.parts {
+                let placement = (frame, item_sub_column[index], *file);
+                groups.entry(placement).or_default().0.push(part.clone());
+                item_groups[index].insert(placement);
+            }
+            for (file, line, name) in &item.declarations {
+                let placement = (frame, item_sub_column[index], *file);
+                groups
+                    .entry(placement)
+                    .or_default()
+                    .1
+                    .push((*line, name.clone()));
+            }
+        }
+
+        let mut nodes: Vec<(ModelNode, Option<Placement>)> = groups
+            .into_iter()
+            .filter(|(_, (parts, _))| !parts.is_empty())
+            .map(|(placement, (mut parts, mut declarations))| {
+                parts.sort();
+                declarations.sort();
+                declarations.dedup();
+                (
+                    ModelNode {
+                        file: placement.2,
+                        parts,
+                        declarations: declarations
+                            .into_iter()
+                            .map(|(_, name)| name.into())
+                            .collect(),
+                    },
+                    Some(placement),
+                )
+            })
+            .collect();
+        for (index, file) in files.iter().enumerate() {
+            if !file.is_go() {
+                nodes.push((
+                    ModelNode {
+                        file: index,
+                        parts: whole_file_parts(file),
+                        declarations: Vec::new(),
+                    },
+                    None,
+                ));
+            }
+        }
+        nodes.sort_by(|(left, _), (right, _)| {
+            (&files[left.file].path, left.parts.first())
+                .cmp(&(&files[right.file].path, right.parts.first()))
+        });
+
+        let node_of_placement: BTreeMap<Placement, usize> = nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (_, placement))| placement.map(|placement| (placement, index)))
+            .collect();
+
+        // Node edges from the item edges, reduced again, because two items can fall into the
+        // same node.
+        let mut node_uses: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+        for (user, dependency) in &item_edges {
+            for user_placement in &item_groups[*user] {
+                for dependency_placement in &item_groups[*dependency] {
+                    let (Some(user_node), Some(dependency_node)) = (
+                        node_of_placement.get(user_placement),
+                        node_of_placement.get(dependency_placement),
+                    ) else {
+                        continue;
+                    };
+                    if user_node != dependency_node {
+                        node_uses
+                            .entry(*user_node)
+                            .or_default()
+                            .insert(*dependency_node);
+                    }
+                }
+            }
+        }
+        let node_reachable: BTreeMap<usize, BTreeSet<usize>> = (0..nodes.len())
+            .map(|node| {
+                let mut reachable = BTreeSet::new();
+                let mut stack = vec![node];
+                while let Some(current) = stack.pop() {
+                    for next in node_uses.get(&current).into_iter().flatten() {
+                        if *next != node && reachable.insert(*next) {
+                            stack.push(*next);
+                        }
+                    }
+                }
+                (node, reachable)
+            })
+            .collect();
+        let node_edges = graph::transitive_reduction(&node_reachable);
+
+        // Vertical order of the frames in each column.
+        let frame_edges: Vec<(usize, usize)> = package_edges
+            .iter()
+            .filter_map(|(user, dependency)| {
+                Some((
+                    *frame_of_key.get(user.as_str())?,
+                    *frame_of_key.get(dependency.as_str())?,
+                ))
+            })
+            .collect();
+        let frame_rows = barycenter_rows(&frame_columns, &frame_edges);
+        let mut frame_order: Vec<usize> = (0..frame_keys.len()).collect();
+        frame_order.sort_by(|left, right| {
+            (frame_columns[*left], frame_rows[*left])
+                .partial_cmp(&(frame_columns[*right], frame_rows[*right]))
+                .unwrap_or(Ordering::Equal)
+        });
+        let mut new_frame_index = vec![0; frame_keys.len()];
+        for (new, old) in frame_order.iter().enumerate() {
+            new_frame_index[*old] = new;
+        }
+
+        // Vertical order of the nodes in each sub-column.
+        let mut frames: Vec<Frame> = Vec::with_capacity(frame_order.len());
+        for old_frame in &frame_order {
+            let (title, _) = &frame_info[&frame_keys[*old_frame]];
+            let mut frame_nodes: Vec<usize> = nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, placement))| {
+                    placement.is_some_and(|(frame, _, _)| frame == *old_frame)
+                })
+                .map(|(index, _)| index)
+                .collect();
+            // The start order for the barycenter sort: normal files first, then tests, then
+            // generated files, each in path order.
+            frame_nodes.sort_by(|left, right| {
+                let key = |node: usize| {
+                    let file = &files[nodes[node].0.file];
+                    (
+                        file.is_generated,
+                        file.is_test(),
+                        &file.path,
+                        nodes[node].0.parts.first().cloned(),
+                    )
+                };
+                key(*left).cmp(&key(*right))
+            });
+            let local_index: BTreeMap<usize, usize> = frame_nodes
+                .iter()
+                .enumerate()
+                .map(|(local, node)| (*node, local))
+                .collect();
+            let local_columns: Vec<usize> = frame_nodes
+                .iter()
+                .map(|node| nodes[*node].1.map_or(0, |(_, sub_column, _)| sub_column))
+                .collect();
+            let local_edges: Vec<(usize, usize)> = node_edges
+                .iter()
+                .filter_map(|(user, dependency)| {
+                    Some((*local_index.get(user)?, *local_index.get(dependency)?))
+                })
+                .collect();
+            let rows = barycenter_rows(&local_columns, &local_edges);
+            let sub_column_count = local_columns
+                .iter()
+                .map(|column| column + 1)
+                .max()
+                .unwrap_or(0);
+            let mut sub_columns: Vec<Vec<(f32, usize)>> = vec![Vec::new(); sub_column_count];
+            for (local, node) in frame_nodes.iter().enumerate() {
+                sub_columns[local_columns[local]].push((rows[local], *node));
+            }
+            frames.push(Frame {
+                title: title.clone().into(),
+                column: frame_columns[*old_frame],
+                sub_columns: sub_columns
+                    .into_iter()
+                    .map(|mut column| {
+                        column.sort_by(|left, right| {
+                            left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal)
+                        });
+                        column.into_iter().map(|(_, node)| node).collect()
+                    })
+                    .collect(),
+            });
+        }
+
+        let make_edge = |user: Endpoint, dependency: Endpoint| {
+            let (from, to) = match order {
+                ReviewOrder::BottomUp => (dependency, user),
+                ReviewOrder::TopDown => (user, dependency),
+            };
+            ModelEdge {
+                from,
+                to,
+                user,
+                dependency,
+            }
+        };
+        let mut edges: Vec<ModelEdge> = if symbols.is_some() {
+            node_edges
+                .iter()
+                .map(|(user, dependency)| {
+                    make_edge(Endpoint::Node(*user), Endpoint::Node(*dependency))
+                })
+                .collect()
+        } else {
+            frame_edges
+                .iter()
+                .map(|(user, dependency)| {
+                    make_edge(
+                        Endpoint::Frame(new_frame_index[*user]),
+                        Endpoint::Frame(new_frame_index[*dependency]),
+                    )
+                })
+                .collect()
+        };
+        edges.sort_by_key(|edge| (edge.from, edge.to));
+
+        let other_files: Vec<usize> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, placement))| placement.is_none())
+            .map(|(index, _)| index)
+            .collect();
+
         Self {
-            frames: ordered_frames,
+            nodes: nodes.into_iter().map(|(node, _)| node).collect(),
+            frames,
             edges,
             other_files,
         }
@@ -238,7 +512,7 @@ impl ReviewModel {
     pub fn frame_of_node(&self, node: usize) -> Option<usize> {
         self.frames
             .iter()
-            .position(|frame| frame.nodes.contains(&node))
+            .position(|frame| frame.nodes().any(|other| other == node))
     }
 
     pub fn frame_with_title(&self, title: &str) -> Option<usize> {
@@ -247,35 +521,108 @@ impl ReviewModel {
             .position(|frame| frame.title.as_ref() == title)
     }
 
-    /// Returns the relation of each frame to the active frame.
-    pub fn frame_relations(&self, active: Option<usize>) -> Vec<Relation> {
-        let mut relations = vec![Relation::Unrelated; self.frames.len()];
+    fn touches(&self, endpoint: Endpoint, active: Active) -> bool {
+        match (endpoint, active) {
+            (Endpoint::Node(node), Active::Node(active)) => node == active,
+            (Endpoint::Node(node), Active::Frame(active)) => {
+                self.frame_of_node(node) == Some(active)
+            }
+            (Endpoint::Frame(frame), Active::Frame(active)) => frame == active,
+            (Endpoint::Frame(frame), Active::Node(active)) => {
+                self.frame_of_node(active) == Some(frame)
+            }
+        }
+    }
+
+    /// Returns the relation of each edge to the active item.
+    pub fn edge_relations(&self, active: Option<Active>) -> Vec<Relation> {
+        self.edges
+            .iter()
+            .map(|edge| {
+                let Some(active) = active else {
+                    return Relation::Unrelated;
+                };
+                match (
+                    self.touches(edge.user, active),
+                    self.touches(edge.dependency, active),
+                ) {
+                    (true, true) => Relation::Active,
+                    (true, false) => Relation::Dependency,
+                    (false, true) => Relation::User,
+                    (false, false) => Relation::Unrelated,
+                }
+            })
+            .collect()
+    }
+
+    /// The ends of the edges that relate to the active item, as `(end, relation)` pairs.
+    fn related_ends(&self, active: Active) -> Vec<(Endpoint, Relation)> {
+        self.edges
+            .iter()
+            .zip(self.edge_relations(Some(active)))
+            .filter_map(|(edge, relation)| match relation {
+                Relation::Dependency => Some((edge.dependency, relation)),
+                Relation::User => Some((edge.user, relation)),
+                Relation::Active | Relation::Unrelated => None,
+            })
+            .collect()
+    }
+
+    /// Returns the relation of each node to the active item.
+    pub fn node_relations(&self, active: Option<Active>) -> Vec<Relation> {
+        let mut relations = vec![Relation::Unrelated; self.nodes.len()];
         let Some(active) = active else {
             return relations;
         };
-        for edge in &self.edges {
-            if edge.user == active {
-                relations[edge.dependency] = Relation::Dependency;
-            } else if edge.dependency == active {
-                relations[edge.user] = Relation::User;
+        for (end, relation) in self.related_ends(active) {
+            if let Endpoint::Node(node) = end
+                && let Some(slot) = relations.get_mut(node)
+                && *slot == Relation::Unrelated
+            {
+                *slot = relation;
             }
         }
-        if let Some(relation) = relations.get_mut(active) {
-            *relation = Relation::Active;
+        let active_nodes: Vec<usize> = match active {
+            Active::Node(node) => vec![node],
+            Active::Frame(frame) => self
+                .frames
+                .get(frame)
+                .map(|frame| frame.nodes().collect())
+                .unwrap_or_default(),
+        };
+        for node in active_nodes {
+            if let Some(slot) = relations.get_mut(node) {
+                *slot = Relation::Active;
+            }
         }
         relations
     }
 
-    /// Returns the relation of each edge to the active frame.
-    pub fn edge_relations(&self, active: Option<usize>) -> Vec<Relation> {
-        self.edges
-            .iter()
-            .map(|edge| match active {
-                Some(active) if edge.user == active => Relation::Dependency,
-                Some(active) if edge.dependency == active => Relation::User,
-                _ => Relation::Unrelated,
-            })
-            .collect()
+    /// Returns the relation of each frame to the active item.
+    pub fn frame_relations(&self, active: Option<Active>) -> Vec<Relation> {
+        let mut relations = vec![Relation::Unrelated; self.frames.len()];
+        let Some(active) = active else {
+            return relations;
+        };
+        for (end, relation) in self.related_ends(active) {
+            let frame = match end {
+                Endpoint::Node(node) => self.frame_of_node(node),
+                Endpoint::Frame(frame) => Some(frame),
+            };
+            if let Some(slot) = frame.and_then(|frame| relations.get_mut(frame))
+                && *slot == Relation::Unrelated
+            {
+                *slot = relation;
+            }
+        }
+        let active_frame = match active {
+            Active::Node(node) => self.frame_of_node(node),
+            Active::Frame(frame) => Some(frame),
+        };
+        if let Some(slot) = active_frame.and_then(|frame| relations.get_mut(frame)) {
+            *slot = Relation::Active;
+        }
+        relations
     }
 
     /// Node indexes in review order. The other files come last.
@@ -283,16 +630,126 @@ impl ReviewModel {
     pub fn review_order(&self) -> Vec<usize> {
         self.frames
             .iter()
-            .flat_map(|frame| frame.nodes.iter().copied())
+            .flat_map(|frame| frame.nodes())
             .chain(self.other_files.iter().copied())
             .collect()
     }
 }
 
-/// Returns a vertical position for each frame in its column. A barycenter sort moves each frame
+fn directory_title(abs_path: &Path, repository_root: &Path) -> String {
+    abs_path
+        .parent()
+        .and_then(|parent| parent.strip_prefix(repository_root).ok())
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .filter(|relative| !relative.is_empty())
+        .unwrap_or_else(|| ".".to_string())
+}
+
+fn whole_file_parts(file: &ChangedFile) -> Vec<BlockPart> {
+    file.change_blocks
+        .iter()
+        .enumerate()
+        .map(|(change_block, rows)| BlockPart {
+            change_block,
+            rows: rows.clone(),
+        })
+        .collect()
+}
+
+/// One item for each Go file, with all of its change blocks. Generated files sort last.
+fn file_items(files: &[ChangedFile], frame_key_of_file: &BTreeMap<usize, String>) -> Vec<Item> {
+    let mut items: Vec<(usize, Item)> = frame_key_of_file
+        .iter()
+        .map(|(file, frame_key)| {
+            (
+                *file,
+                Item {
+                    frame_key: frame_key.clone(),
+                    parts: whole_file_parts(&files[*file])
+                        .into_iter()
+                        .map(|part| (*file, part))
+                        .collect(),
+                    declarations: Vec::new(),
+                },
+            )
+        })
+        .collect();
+    items.sort_by_key(|(file, _)| files[*file].is_generated);
+    items.into_iter().map(|(_, item)| item).collect()
+}
+
+/// Items from the symbol graph: one for each unit of changed declarations, and one for each file
+/// with changes outside all declarations. Returns the `(user, dependency)` edges between items.
+fn symbol_items(
+    files: &[ChangedFile],
+    frame_key_of_file: &BTreeMap<usize, String>,
+    symbols: &SymbolGraph,
+) -> (Vec<Item>, Vec<(usize, usize)>) {
+    let mut declaration_parts: BTreeMap<usize, Vec<(usize, BlockPart)>> = BTreeMap::new();
+    let mut file_level_parts: BTreeMap<usize, Vec<BlockPart>> = BTreeMap::new();
+    for file_index in frame_key_of_file.keys() {
+        let file = &files[*file_index];
+        for (change_block, rows) in file.change_blocks.iter().enumerate() {
+            for (owner, rows) in symbols.split_change(&file.abs_path, rows.clone()) {
+                let part = BlockPart { change_block, rows };
+                match owner {
+                    Some(declaration) => declaration_parts
+                        .entry(declaration)
+                        .or_default()
+                        .push((*file_index, part)),
+                    None => file_level_parts.entry(*file_index).or_default().push(part),
+                }
+            }
+        }
+    }
+
+    let changed: BTreeSet<usize> = declaration_parts.keys().copied().collect();
+    let units = symbols.units(&changed);
+    let file_of_path: BTreeMap<&Path, usize> = files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| (file.abs_path.as_path(), index))
+        .collect();
+
+    let mut items = Vec::new();
+    for members in &units.units {
+        let mut item = Item::default();
+        for member in members {
+            let Some(declaration) = symbols.declaration(*member) else {
+                continue;
+            };
+            let Some(file) = file_of_path.get(declaration.file.as_path()).copied() else {
+                continue;
+            };
+            if item.frame_key.is_empty()
+                && let Some(frame_key) = frame_key_of_file.get(&file)
+            {
+                item.frame_key = frame_key.clone();
+            }
+            item.parts
+                .extend(declaration_parts.get(member).into_iter().flatten().cloned());
+            item.declarations
+                .push((file, declaration.start_line, declaration.name.clone()));
+        }
+        items.push(item);
+    }
+    for (file, parts) in file_level_parts {
+        if let Some(frame_key) = frame_key_of_file.get(&file) {
+            items.push(Item {
+                frame_key: frame_key.clone(),
+                parts: parts.into_iter().map(|part| (file, part)).collect(),
+                declarations: Vec::new(),
+            });
+        }
+    }
+    (items, units.edges)
+}
+
+/// Returns a vertical position for each item in its column. A barycenter sort moves each item
 /// toward the average position of its neighbors in other columns, so that fewer arrows cross.
-fn barycenter_rows(frames: &[Frame], edges: &[(usize, usize)]) -> Vec<f32> {
-    let mut neighbors = vec![Vec::new(); frames.len()];
+/// The input order is the start order in each column.
+fn barycenter_rows(columns_of: &[usize], edges: &[(usize, usize)]) -> Vec<f32> {
+    let mut neighbors = vec![Vec::new(); columns_of.len()];
     for (user, dependency) in edges {
         if let Some(list) = neighbors.get_mut(*user) {
             list.push(*dependency);
@@ -302,20 +759,20 @@ fn barycenter_rows(frames: &[Frame], edges: &[(usize, usize)]) -> Vec<f32> {
         }
     }
 
-    let column_count = frames
+    let column_count = columns_of
         .iter()
-        .map(|frame| frame.column + 1)
+        .map(|column| column + 1)
         .max()
         .unwrap_or(0);
     let mut columns: Vec<Vec<usize>> = vec![Vec::new(); column_count];
-    for (index, frame) in frames.iter().enumerate() {
-        columns[frame.column].push(index);
+    for (index, column) in columns_of.iter().enumerate() {
+        columns[*column].push(index);
     }
 
-    let mut rows = vec![0.; frames.len()];
+    let mut rows = vec![0.; columns_of.len()];
     for column in &columns {
-        for (row, frame) in column.iter().enumerate() {
-            rows[*frame] = row as f32;
+        for (row, item) in column.iter().enumerate() {
+            rows[*item] = row as f32;
         }
     }
 
@@ -327,27 +784,27 @@ fn barycenter_rows(frames: &[Frame], edges: &[(usize, usize)]) -> Vec<f32> {
         };
         for column_index in column_indexes {
             let column = &mut columns[column_index];
-            let barycenter = |frame: usize| -> f32 {
-                let positions: Vec<f32> = neighbors[frame]
+            let barycenter = |item: usize| -> f32 {
+                let positions: Vec<f32> = neighbors[item]
                     .iter()
-                    .filter(|neighbor| frames[**neighbor].column != column_index)
+                    .filter(|neighbor| columns_of[**neighbor] != column_index)
                     .map(|neighbor| rows[*neighbor])
                     .collect();
                 if positions.is_empty() {
-                    rows[frame]
+                    rows[item]
                 } else {
                     positions.iter().sum::<f32>() / positions.len() as f32
                 }
             };
             let mut keyed: Vec<(f32, usize)> = column
                 .iter()
-                .map(|frame| (barycenter(*frame), *frame))
+                .map(|item| (barycenter(*item), *item))
                 .collect();
-            // A stable sort keeps the title order between frames with the same barycenter.
+            // A stable sort keeps the start order between items with the same barycenter.
             keyed.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
-            *column = keyed.into_iter().map(|(_, frame)| frame).collect();
-            for (row, frame) in column.iter().enumerate() {
-                rows[*frame] = row as f32;
+            *column = keyed.into_iter().map(|(_, item)| item).collect();
+            for (row, item) in column.iter().enumerate() {
+                rows[*item] = row as f32;
             }
         }
     }
@@ -368,32 +825,55 @@ impl Layout {
     pub fn new(model: &ReviewModel, body_heights: &[Pixels]) -> Self {
         let node_height =
             |node: usize| NODE_HEADER_HEIGHT + body_heights.get(node).copied().unwrap_or_default();
-        let frame_width = NODE_WIDTH + FRAME_PADDING * 2.;
-        let mut node_bounds = vec![Bounds::default(); body_heights.len()];
-        let mut frame_bounds = Vec::with_capacity(model.frames.len());
-        let mut column_bottoms: Vec<Pixels> = Vec::new();
+        let frame_width = |frame: &Frame| {
+            let sub_columns = frame.sub_columns.len().max(1) as f32;
+            NODE_WIDTH * sub_columns + SUB_COLUMN_GAP * (sub_columns - 1.) + FRAME_PADDING * 2.
+        };
 
+        let column_count = model
+            .frames
+            .iter()
+            .map(|frame| frame.column + 1)
+            .max()
+            .unwrap_or(0);
+        let mut column_widths = vec![px(0.); column_count];
         for frame in &model.frames {
-            if column_bottoms.len() <= frame.column {
-                column_bottoms.resize(frame.column + 1, px(0.));
-            }
-            let left = (frame_width + COLUMN_GAP) * frame.column as f32;
+            column_widths[frame.column] = column_widths[frame.column].max(frame_width(frame));
+        }
+        let mut column_lefts = Vec::with_capacity(column_count);
+        let mut left = px(0.);
+        for width in &column_widths {
+            column_lefts.push(left);
+            left += *width + COLUMN_GAP;
+        }
+
+        let mut node_bounds = vec![Bounds::default(); model.nodes.len()];
+        let mut frame_bounds = Vec::with_capacity(model.frames.len());
+        let mut column_bottoms = vec![px(0.); column_count];
+        for frame in &model.frames {
+            let left = column_lefts[frame.column];
             let top = column_bottoms[frame.column];
-            let mut node_top = top + FRAME_HEADER_HEIGHT;
-            for node in &frame.nodes {
-                let height = node_height(*node);
-                if let Some(bounds) = node_bounds.get_mut(*node) {
-                    *bounds = Bounds::new(
-                        point(left + FRAME_PADDING, node_top),
-                        size(NODE_WIDTH, height),
-                    );
+            let body_top = top + FRAME_HEADER_HEIGHT;
+            let mut tallest = px(0.);
+            for (sub_column, nodes) in frame.sub_columns.iter().enumerate() {
+                let node_left =
+                    left + FRAME_PADDING + (NODE_WIDTH + SUB_COLUMN_GAP) * sub_column as f32;
+                let mut node_top = body_top;
+                for node in nodes {
+                    let height = node_height(*node);
+                    if let Some(bounds) = node_bounds.get_mut(*node) {
+                        *bounds = Bounds::new(point(node_left, node_top), size(NODE_WIDTH, height));
+                    }
+                    node_top += height + NODE_GAP;
                 }
-                node_top += height + NODE_GAP;
+                if !nodes.is_empty() {
+                    tallest = tallest.max(node_top - NODE_GAP - body_top);
+                }
             }
-            let bottom = node_top - NODE_GAP + FRAME_PADDING;
+            let bottom = body_top + tallest + FRAME_PADDING;
             frame_bounds.push(Bounds::new(
                 point(left, top),
-                size(frame_width, bottom - top),
+                size(frame_width(frame), bottom - top),
             ));
             column_bottoms[frame.column] = bottom + FRAME_GAP;
         }
@@ -441,43 +921,53 @@ impl Layout {
             .copied()
             .reduce(|content, bounds| content.union(&bounds))
     }
+
+    pub fn endpoint_bounds(&self, endpoint: Endpoint) -> Option<Bounds<Pixels>> {
+        match endpoint {
+            Endpoint::Node(node) => self.node_bounds.get(node).copied(),
+            Endpoint::Frame(frame) => self.frame_bounds.get(frame).copied(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn node(path: &str) -> NodeInfo {
-        NodeInfo {
-            path: path.to_string(),
-            abs_path: Path::new("/project").join(path),
-            is_generated: path.ends_with("_gen.go"),
-        }
-    }
-
-    /// The changed files of the `feature/discounts` branch in `test-repos/`.
-    fn discounts_nodes() -> Vec<NodeInfo> {
-        [
-            "README.md",
+    /// The changed files of the `feature/discounts` branch in `test-repos/`, with the head rows
+    /// of their change blocks (from `git diff -U0`).
+    const DISCOUNTS_FILES: &[(&str, &[(u32, u32)])] = &[
+        ("README.md", &[(5, 10)]),
+        (
             "api/api.go",
-            "config/shop.yaml",
-            "internal/catalog/catalog.go",
-            "internal/catalog/category.go",
-            "internal/legacy/legacy.go",
-            "internal/money/money.go",
-            "internal/money/money_test.go",
-            "internal/notify/notify.go",
-            "internal/orders/discount.go",
-            "internal/orders/discount_table_gen.go",
-            "internal/orders/orders.go",
-            "internal/orders/orders_ext_test.go",
-            "internal/orders/orders_test.go",
-            "internal/payments/payments.go",
-            "migrations/0002_discounts.sql",
-        ]
-        .into_iter()
-        .map(node)
-        .collect()
+            &[(24, 25), (34, 35), (39, 40), (43, 44), (46, 53)],
+        ),
+        ("config/shop.yaml", &[(5, 9)]),
+        ("internal/catalog/catalog.go", &[(7, 11), (25, 28)]),
+        ("internal/catalog/category.go", &[(0, 24)]),
+        ("internal/legacy/legacy.go", &[(0, 0)]),
+        ("internal/money/money.go", &[(26, 34)]),
+        ("internal/money/money_test.go", &[(0, 12)]),
+        ("internal/notify/notify.go", &[(3, 8), (21, 32)]),
+        ("internal/orders/discount.go", &[(0, 33)]),
+        ("internal/orders/discount_table_gen.go", &[(0, 11)]),
+        ("internal/orders/orders.go", &[(18, 19), (22, 24), (28, 33)]),
+        ("internal/orders/orders_ext_test.go", &[(0, 17)]),
+        ("internal/orders/orders_test.go", &[(11, 12), (19, 30)]),
+        ("internal/payments/payments.go", &[(21, 34)]),
+        ("migrations/0002_discounts.sql", &[(0, 1)]),
+    ];
+
+    fn discounts_files() -> Vec<ChangedFile> {
+        DISCOUNTS_FILES
+            .iter()
+            .map(|(path, blocks)| ChangedFile {
+                path: path.to_string(),
+                abs_path: Path::new("/project").join(path),
+                is_generated: path.ends_with("_gen.go"),
+                change_blocks: blocks.iter().map(|(start, end)| *start..*end).collect(),
+            })
+            .collect()
     }
 
     fn shop_packages() -> GoPackages {
@@ -485,117 +975,124 @@ mod tests {
             .expect("the fixture parses")
     }
 
-    fn frame_summary(model: &ReviewModel, nodes: &[NodeInfo]) -> Vec<(usize, String, Vec<String>)> {
-        model
-            .frames
+    fn shop_symbols() -> SymbolGraph {
+        SymbolGraph::parse(include_bytes!("../test_data/shop_symbols.json"))
+            .expect("the fixture parses")
+    }
+
+    fn build(order: ReviewOrder, with_symbols: bool) -> (Vec<ChangedFile>, ReviewModel) {
+        let files = discounts_files();
+        let packages = shop_packages();
+        let symbols = shop_symbols();
+        let model = ReviewModel::build(
+            &files,
+            Some(&packages),
+            with_symbols.then_some(&symbols),
+            Path::new("/project"),
+            order,
+        );
+        (files, model)
+    }
+
+    fn file_name(files: &[ChangedFile], model: &ReviewModel, node: usize) -> String {
+        files[model.nodes[node].file]
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// `file:declaration,declaration` for each node.
+    fn node_label(files: &[ChangedFile], model: &ReviewModel, node: usize) -> String {
+        format!(
+            "{}:{}",
+            file_name(files, model, node),
+            model.nodes[node].declarations.join(",")
+        )
+    }
+
+    fn sub_column_labels(
+        files: &[ChangedFile],
+        model: &ReviewModel,
+        title: &str,
+    ) -> Vec<Vec<String>> {
+        let frame = model.frame_with_title(title).expect("the frame exists");
+        model.frames[frame]
+            .sub_columns
             .iter()
-            .map(|frame| {
-                (
-                    frame.column,
-                    frame.title.to_string(),
-                    frame
-                        .nodes
-                        .iter()
-                        .map(|node| {
-                            nodes[*node]
-                                .path
-                                .rsplit('/')
-                                .next()
-                                .unwrap_or("")
-                                .to_string()
-                        })
-                        .collect(),
-                )
+            .map(|column| {
+                let mut labels: Vec<String> = column
+                    .iter()
+                    .map(|node| node_label(files, model, *node))
+                    .collect();
+                labels.sort();
+                labels
             })
             .collect()
     }
 
-    fn edge_titles(model: &ReviewModel) -> Vec<(String, String)> {
+    fn edge_labels(files: &[ChangedFile], model: &ReviewModel) -> BTreeSet<(String, String)> {
+        let label = |endpoint: Endpoint| match endpoint {
+            Endpoint::Node(node) => node_label(files, model, node),
+            Endpoint::Frame(frame) => model.frames[frame].title.to_string(),
+        };
         model
             .edges
             .iter()
-            .map(|edge| {
-                (
-                    model.frames[edge.from].title.to_string(),
-                    model.frames[edge.to].title.to_string(),
-                )
-            })
+            .map(|edge| (label(edge.user), label(edge.dependency)))
             .collect()
     }
 
-    fn strings(names: &[&str]) -> Vec<String> {
-        names.iter().map(|name| name.to_string()).collect()
-    }
-
     #[test]
-    fn test_bottom_up_model_of_the_discounts_branch() {
-        let nodes = discounts_nodes();
-        let packages = shop_packages();
-        let model = ReviewModel::build(
-            &nodes,
-            Some(&packages),
-            Path::new("/project"),
-            ReviewOrder::BottomUp,
-        );
+    fn test_symbol_model_of_the_discounts_branch() {
+        let (files, model) = build(ReviewOrder::BottomUp, true);
 
         assert_eq!(
-            frame_summary(&model, &nodes),
-            vec![
-                (0, "internal/legacy".into(), strings(&["legacy.go"])),
-                (
-                    0,
-                    "internal/money".into(),
-                    strings(&["money.go", "money_test.go"])
-                ),
-                (0, "internal/notify".into(), strings(&["notify.go"])),
-                (
-                    1,
-                    "internal/catalog".into(),
-                    strings(&["catalog.go", "category.go"])
-                ),
-                (1, "internal/payments".into(), strings(&["payments.go"])),
-                (
-                    2,
-                    "internal/orders".into(),
-                    strings(&[
-                        "discount.go",
-                        "orders.go",
-                        "orders_test.go",
-                        "discount_table_gen.go"
-                    ])
-                ),
-                (
-                    3,
-                    "internal/orders_test".into(),
-                    strings(&["orders_ext_test.go"])
-                ),
-                (3, "api".into(), strings(&["api.go"])),
-            ]
-        );
-
-        let mut edges = edge_titles(&model);
-        edges.sort();
-        assert_eq!(
-            edges,
+            sub_column_labels(&files, &model, "internal/orders"),
             [
-                ("internal/catalog", "internal/orders"),
-                ("internal/money", "internal/catalog"),
-                ("internal/money", "internal/payments"),
-                ("internal/notify", "api"),
-                ("internal/orders", "api"),
-                ("internal/orders", "internal/orders_test"),
-                ("internal/payments", "api"),
+                vec!["discount.go:Code", "discount_table_gen.go:"],
+                vec!["discount_table_gen.go:discountTable", "orders.go:Order"],
+                vec!["discount.go:percentFor"],
+                vec!["discount.go:applyCode"],
+                vec!["orders.go:Place"],
+                vec!["orders_test.go:TestPlace,TestPlaceWithCode"],
             ]
-            .map(|(from, to)| (from.to_string(), to.to_string()))
         );
+        let discount_nodes = (0..model.nodes.len())
+            .filter(|node| file_name(&files, &model, *node) == "discount.go")
+            .count();
+        assert!(
+            discount_nodes > 1,
+            "a new file splits into its declarations"
+        );
+
+        let edges = edge_labels(&files, &model);
+        let has_edge = |user: &str, dependency: &str| {
+            edges.iter().any(|(edge_user, edge_dependency)| {
+                edge_user.contains(user) && edge_dependency.contains(dependency)
+            })
+        };
+        for (user, dependency) in [
+            ("applyCode", "Discount"),
+            ("applyCode", "percentFor"),
+            ("percentFor", "discountTable"),
+            ("Place", "applyCode"),
+            ("Place", "Product"),
+            ("ServeHTTP", "Place"),
+            ("ServeHTTP", "ChargeWithRetry"),
+            ("TestUnknownCode", "Place"),
+        ] {
+            assert!(has_edge(user, dependency), "missing {user} -> {dependency}");
+        }
         for edge in &model.edges {
-            assert!(model.frames[edge.from].column < model.frames[edge.to].column);
+            assert!(matches!(edge.from, Endpoint::Node(_)) && matches!(edge.to, Endpoint::Node(_)));
         }
 
         let other_files: Vec<&str> = model
             .other_files
             .iter()
-            .map(|node| nodes[*node].path.as_str())
+            .map(|node| files[model.nodes[*node].file].path.as_str())
             .collect();
         assert_eq!(
             other_files,
@@ -605,40 +1102,141 @@ mod tests {
                 "migrations/0002_discounts.sql"
             ]
         );
-        assert_eq!(model.review_order().len(), nodes.len());
+
+        let mut review_order = model.review_order();
+        review_order.sort();
+        review_order.dedup();
+        assert_eq!(
+            review_order.len(),
+            model.nodes.len(),
+            "every node is in the review order once"
+        );
     }
 
     #[test]
-    fn test_top_down_mirrors_the_columns() {
-        let nodes = discounts_nodes();
-        let packages = shop_packages();
-        let model = ReviewModel::build(
-            &nodes,
-            Some(&packages),
-            Path::new("/project"),
-            ReviewOrder::TopDown,
+    fn test_reversed_order_keeps_the_nodes_and_mirrors_columns() {
+        let (files, bottom_up) = build(ReviewOrder::BottomUp, true);
+        let (_, top_down) = build(ReviewOrder::TopDown, true);
+        assert_eq!(bottom_up.nodes, top_down.nodes);
+
+        let mut reversed = sub_column_labels(&files, &top_down, "internal/orders");
+        reversed.reverse();
+        assert_eq!(
+            reversed,
+            sub_column_labels(&files, &bottom_up, "internal/orders")
         );
-        let column_of = |title: &str| {
+
+        let column_of = |model: &ReviewModel, title: &str| {
+            model
+                .frame_with_title(title)
+                .map(|frame| model.frames[frame].column)
+        };
+        assert_eq!(column_of(&bottom_up, "api"), Some(3));
+        assert_eq!(column_of(&top_down, "api"), Some(0));
+        assert_eq!(
+            edge_labels(&files, &bottom_up),
+            edge_labels(&files, &top_down)
+        );
+    }
+
+    #[test]
+    fn test_arrows_go_left_to_right() {
+        for order in [ReviewOrder::BottomUp, ReviewOrder::TopDown] {
+            let (_, model) = build(order, true);
+            let body_heights = vec![px(100.); model.nodes.len()];
+            let layout = Layout::new(&model, &body_heights);
+            for edge in &model.edges {
+                let from = layout.endpoint_bounds(edge.from).expect("the start exists");
+                let to = layout.endpoint_bounds(edge.to).expect("the end exists");
+                assert!(from.right() < to.left(), "{order:?}: {edge:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_layout_keeps_nodes_inside_their_frames() {
+        let (_, model) = build(ReviewOrder::BottomUp, true);
+        let body_heights = vec![px(100.); model.nodes.len()];
+        let layout = Layout::new(&model, &body_heights);
+
+        for (frame, bounds) in model.frames.iter().zip(&layout.frame_bounds) {
+            for node in frame.nodes() {
+                let node_bounds = layout.node_bounds[node];
+                assert!(
+                    bounds.contains(&node_bounds.origin)
+                        && bounds.contains(&node_bounds.bottom_right()),
+                    "a node must be inside its frame"
+                );
+            }
+        }
+        for (index, left) in layout.frame_bounds.iter().enumerate() {
+            for right in layout.frame_bounds.iter().skip(index + 1) {
+                assert!(!left.intersects(right), "frames must not overlap");
+            }
+        }
+
+        let other_files = layout.other_files_bounds.expect("there are other files");
+        let lowest_frame = layout
+            .frame_bounds
+            .iter()
+            .map(|bounds| bounds.bottom())
+            .fold(px(0.), |lowest, bottom| lowest.max(bottom));
+        assert!(other_files.top() > lowest_frame);
+    }
+
+    #[test]
+    fn test_without_symbols_files_are_nodes_and_frames_are_connected() {
+        let (files, model) = build(ReviewOrder::BottomUp, false);
+        let orders = model
+            .frame_with_title("internal/orders")
+            .expect("the frame exists");
+        let labels: Vec<String> = model.frames[orders]
+            .nodes()
+            .map(|node| file_name(&files, &model, node))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "discount.go",
+                "orders.go",
+                "orders_test.go",
+                "discount_table_gen.go"
+            ]
+        );
+        assert!(
             model
                 .frames
                 .iter()
-                .find(|frame| frame.title.as_ref() == title)
-                .map(|frame| frame.column)
-        };
-        assert_eq!(column_of("api"), Some(0));
-        assert_eq!(column_of("internal/orders"), Some(1));
-        assert_eq!(column_of("internal/money"), Some(3));
-        assert_eq!(model.frames.first().map(|frame| frame.column), Some(0));
-        for edge in &model.edges {
-            assert!(model.frames[edge.from].column < model.frames[edge.to].column);
-        }
-        assert!(edge_titles(&model).contains(&("api".to_string(), "internal/orders".to_string())));
+                .all(|frame| frame.sub_columns.len() == 1)
+        );
+
+        let mut edges: Vec<(String, String)> = edge_labels(&files, &model).into_iter().collect();
+        edges.sort();
+        assert_eq!(
+            edges,
+            [
+                ("api", "internal/notify"),
+                ("api", "internal/orders"),
+                ("api", "internal/payments"),
+                ("internal/catalog", "internal/money"),
+                ("internal/orders", "internal/catalog"),
+                ("internal/orders_test", "internal/orders"),
+                ("internal/payments", "internal/money"),
+            ]
+            .map(|(user, dependency)| (user.to_string(), dependency.to_string()))
+        );
     }
 
     #[test]
     fn test_without_packages_each_directory_is_a_frame() {
-        let nodes = discounts_nodes();
-        let model = ReviewModel::build(&nodes, None, Path::new("/project"), ReviewOrder::BottomUp);
+        let files = discounts_files();
+        let model = ReviewModel::build(
+            &files,
+            None,
+            None,
+            Path::new("/project"),
+            ReviewOrder::BottomUp,
+        );
         assert!(model.edges.is_empty());
         assert!(model.frames.iter().all(|frame| frame.column == 0));
         let titles: Vec<&str> = model
@@ -661,91 +1259,52 @@ mod tests {
     }
 
     #[test]
-    fn test_layout_places_frames_in_columns_and_other_files_below() {
-        let nodes = discounts_nodes();
-        let packages = shop_packages();
-        let model = ReviewModel::build(
-            &nodes,
-            Some(&packages),
-            Path::new("/project"),
-            ReviewOrder::BottomUp,
-        );
-        let body_heights = vec![px(100.); nodes.len()];
-        let layout = Layout::new(&model, &body_heights);
-
-        for (frame, bounds) in model.frames.iter().zip(&layout.frame_bounds) {
-            for node in &frame.nodes {
-                let node_bounds = layout.node_bounds[*node];
-                assert!(
-                    bounds.contains(&node_bounds.origin)
-                        && bounds.contains(&node_bounds.bottom_right()),
-                    "a node must be inside its frame"
-                );
-            }
-        }
-        for edge in &model.edges {
-            let from = layout.frame_bounds[edge.from];
-            let to = layout.frame_bounds[edge.to];
-            assert!(from.right() < to.left(), "arrows go from left to right");
-        }
-
-        let other_files = layout.other_files_bounds.expect("there are other files");
-        let lowest_frame = layout
-            .frame_bounds
-            .iter()
-            .map(|bounds| bounds.bottom())
-            .fold(px(0.), |lowest, bottom| lowest.max(bottom));
-        assert!(other_files.top() > lowest_frame);
-        for node in &model.other_files {
-            assert!(other_files.contains(&layout.node_bounds[*node].origin));
-        }
-    }
-
-    #[test]
-    fn test_relations_follow_the_meaning_of_the_edges() {
-        let nodes = discounts_nodes();
-        let packages = shop_packages();
+    fn test_relations_of_an_active_node() {
         for order in [ReviewOrder::BottomUp, ReviewOrder::TopDown] {
-            let model = ReviewModel::build(&nodes, Some(&packages), Path::new("/project"), order);
-            let frame = |title: &str| model.frame_with_title(title).expect("the frame exists");
-            let orders = frame("internal/orders");
-
-            let relations = model.frame_relations(Some(orders));
-            let titles_with = |relation: Relation| -> Vec<String> {
-                let mut titles: Vec<String> = model
-                    .frames
-                    .iter()
-                    .zip(&relations)
-                    .filter(|(_, frame_relation)| **frame_relation == relation)
-                    .map(|(frame, _)| frame.title.to_string())
+            let (files, model) = build(order, true);
+            let apply_code = (0..model.nodes.len())
+                .find(|node| node_label(&files, &model, *node).ends_with(":applyCode"))
+                .expect("applyCode has its own node");
+            let relations = model.node_relations(Some(Active::Node(apply_code)));
+            let with = |relation: Relation| -> Vec<String> {
+                let mut labels: Vec<String> = (0..model.nodes.len())
+                    .filter(|node| relations[*node] == relation)
+                    .map(|node| node_label(&files, &model, node))
                     .collect();
-                titles.sort();
-                titles
+                labels.sort();
+                labels
             };
-            assert_eq!(titles_with(Relation::Active), ["internal/orders"]);
-            assert_eq!(titles_with(Relation::Dependency), ["internal/catalog"]);
-            assert_eq!(titles_with(Relation::User), ["api", "internal/orders_test"]);
-
-            let edge_relations = model.edge_relations(Some(orders));
-            let count = |relation: Relation| {
-                edge_relations
+            assert_eq!(with(Relation::Active), ["discount.go:applyCode"]);
+            assert!(
+                with(Relation::Dependency)
                     .iter()
-                    .filter(|edge_relation| **edge_relation == relation)
-                    .count()
-            };
-            assert_eq!(count(Relation::Dependency), 1, "{order:?}");
-            assert_eq!(count(Relation::User), 2, "{order:?}");
-            assert_eq!(
-                count(Relation::Unrelated),
-                model.edges.len() - 3,
-                "{order:?}"
+                    .any(|label| label.contains("Discount")),
+                "{order:?}: {:?}",
+                with(Relation::Dependency)
+            );
+            assert!(
+                with(Relation::User)
+                    .iter()
+                    .any(|label| label.contains("Place")),
+                "{order:?}: {:?}",
+                with(Relation::User)
             );
 
-            assert!(
+            let frame_relations = model.frame_relations(Some(Active::Node(apply_code)));
+            let frame = |title: &str| {
                 model
-                    .edge_relations(None)
-                    .iter()
-                    .all(|relation| *relation == Relation::Unrelated)
+                    .frame_with_title(title)
+                    .map(|frame| frame_relations[frame])
+            };
+            assert_eq!(
+                frame("internal/orders"),
+                Some(Relation::Active),
+                "{order:?}"
+            );
+            assert_eq!(
+                frame("internal/money"),
+                Some(Relation::Dependency),
+                "{order:?}"
             );
         }
     }

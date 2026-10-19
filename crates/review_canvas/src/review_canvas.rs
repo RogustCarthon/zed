@@ -1,21 +1,27 @@
+mod graph;
 mod package_graph;
 mod review_model;
+mod symbol_graph;
 
 use std::{
     cell::{Cell, RefCell},
-    ffi::OsString,
+    collections::BTreeSet,
+    ffi::{OsStr, OsString},
+    hash::{DefaultHasher, Hash as _, Hasher as _},
     ops::Range,
-    path::Path,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
 };
 
 use anyhow::{Context as _, Result, anyhow};
+use buffer_diff::BufferDiff;
+use collections::HashMap;
 use editor::{
     Editor, EditorMode, HiddenUnstagedDiffHunkRenderer, MinimapVisibility, SizingBehavior,
     multibuffer_context_lines,
 };
-use futures::{FutureExt as _, StreamExt as _, stream};
+use futures::{FutureExt as _, StreamExt as _, future::Shared, stream};
 use futures_lite::future::yield_now;
 use git::{repository::RepoPath, status::FileStatus};
 use gpui::{
@@ -25,7 +31,7 @@ use gpui::{
     ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Task, TextStyleRefinement,
     WeakEntity, Window, actions, canvas, fill, point, px, size,
 };
-use language::{Capability, OffsetRangeExt as _, language_settings::SoftWrap};
+use language::{Buffer, Capability, OffsetRangeExt as _, language_settings::SoftWrap};
 use multi_buffer::{MultiBuffer, MultiBufferRow, PathKey};
 use package_graph::{GO_LIST_JSON_FIELDS, GoPackages};
 use project::{
@@ -33,9 +39,11 @@ use project::{
     git_store::diff_buffer_list::{BranchDiffEvent, DiffBase, DiffBufferList, LoadedDiffBuffer},
 };
 use review_model::{
-    FRAME_HEADER_HEIGHT, Layout, NODE_HEADER_HEIGHT, NodeInfo, Relation, ReviewModel, ReviewOrder,
+    Active, ChangedFile, Endpoint, FRAME_HEADER_HEIGHT, Layout, ModelNode, NODE_HEADER_HEIGHT,
+    Relation, ReviewModel, ReviewOrder,
 };
 use settings::Settings as _;
+use symbol_graph::{ANALYZER_SOURCES, SymbolGraph};
 use theme_settings::ThemeSettings;
 use ui::{Button, Icon, IconName, LabelSize, prelude::*};
 use util::ResultExt as _;
@@ -94,11 +102,28 @@ pub fn init(cx: &mut App) {
 }
 
 struct CanvasNode {
-    info: NodeInfo,
     title: SharedString,
     editor: Entity<Editor>,
     line_lengths: Arc<[u32]>,
     estimated_body_height: Pixels,
+}
+
+/// A changed file with its buffers. The model decides how its change blocks split into nodes.
+struct LoadedFile {
+    info: ChangedFile,
+    status: &'static str,
+    display_buffer: Entity<Buffer>,
+    diff: Entity<BufferDiff>,
+}
+
+/// What the symbol analyzer does in tests.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+enum AnalyzerForTests {
+    /// No symbol graph, and no warning.
+    Skip,
+    /// Build and run the real analyzer.
+    Real,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -165,15 +190,20 @@ pub struct ReviewCanvas {
     repository_root: Option<Arc<Path>>,
     diff_list: Option<Entity<DiffBufferList>>,
     load_state: LoadState,
+    files: Vec<LoadedFile>,
+    /// One editor for each node of the model, in the same order.
     nodes: Vec<CanvasNode>,
     order: ReviewOrder,
     model: ReviewModel,
     go_packages: Option<Rc<GoPackages>>,
-    /// Shows when the package graph is not available, for example when `go list` fails.
+    symbols: Option<Rc<SymbolGraph>>,
+    /// Shows when the package graph or the symbol graph is not available.
     graph_warning: Option<SharedString>,
     /// The output that `go list` gives in tests. `None` runs the real command.
     #[cfg(test)]
     go_list_output_for_tests: Option<String>,
+    #[cfg(test)]
+    analyzer_for_tests: AnalyzerForTests,
     /// Editor body heights in world units. Starts as an estimate, then node paint replaces it
     /// with the measured height, because an editor sized by content only knows its height
     /// after layout.
@@ -187,8 +217,8 @@ pub struct ReviewCanvas {
     painted_node_count: usize,
     /// The frame that the user selected with a click. A focused node editor wins over this.
     selected_frame: Option<SharedString>,
-    /// The frame whose arrows the last render highlighted.
-    active_frame: Option<usize>,
+    /// The item whose arrows the last render highlighted.
+    active: Option<Active>,
     _diff_list_subscription: Option<Subscription>,
     _open_task: Task<()>,
     _refresh_task: Task<()>,
@@ -215,13 +245,17 @@ impl ReviewCanvas {
             repository_root: None,
             diff_list: None,
             load_state: LoadState::Loading,
+            files: Vec::new(),
             nodes: Vec::new(),
             order: ReviewOrder::default(),
             model: ReviewModel::default(),
             go_packages: None,
+            symbols: None,
             graph_warning: None,
             #[cfg(test)]
             go_list_output_for_tests: Some(String::new()),
+            #[cfg(test)]
+            analyzer_for_tests: AnalyzerForTests::Skip,
             body_heights: Rc::default(),
             viewport: Rc::default(),
             camera: Camera {
@@ -233,7 +267,7 @@ impl ReviewCanvas {
             pinch_zoom_accumulator: 0.,
             painted_node_count: 0,
             selected_frame: None,
-            active_frame: None,
+            active: None,
             _diff_list_subscription: None,
             _open_task: open_task,
             _refresh_task: Task::ready(()),
@@ -313,7 +347,6 @@ impl ReviewCanvas {
         };
         diff_buffers.sort_by(|left, right| left.repo_path.cmp(&right.repo_path));
 
-        // Ordered, so that the grid order follows the path order.
         let mut loads = stream::iter(diff_buffers.into_iter().map(|diff_buffer| {
             let repo_path = diff_buffer.repo_path;
             let file_status = diff_buffer.file_status;
@@ -323,7 +356,7 @@ impl ReviewCanvas {
         }))
         .buffered(MAX_CONCURRENT_BUFFER_LOADS);
 
-        let mut nodes = Vec::new();
+        let mut files = Vec::new();
         while let Some((repo_path, file_status, loaded)) = loads.next().await {
             // Buffered loads can already be complete when polled. Without a yield, this loop
             // would never await and would starve the foreground thread.
@@ -331,20 +364,44 @@ impl ReviewCanvas {
             let Some(loaded) = loaded.log_err() else {
                 continue;
             };
-            let node = this.update_in(cx, |this, window, cx| {
-                this.build_node(&repo_path, file_status, loaded, window, cx)
+            let file = this.update(cx, |this, cx| {
+                this.load_file(&repo_path, file_status, loaded, cx)
             })?;
-            nodes.extend(node);
+            files.extend(file);
         }
 
-        let go_packages = if nodes.iter().any(|node| node.info.is_go()) {
+        let infos: Vec<ChangedFile> = files.iter().map(|file| file.info.clone()).collect();
+        let go_packages = if infos.iter().any(ChangedFile::is_go) {
             let go_list = this.update(cx, |this, cx| this.go_list(cx))?;
-            Some(go_list.await)
+            Some(go_list.await.map(Rc::new))
         } else {
             None
         };
+        let symbols = match &go_packages {
+            Some(Ok(go_packages)) => {
+                let analysis =
+                    this.update(cx, |this, cx| this.analyze_symbols(&infos, go_packages, cx))?;
+                Some(analysis.await)
+            }
+            Some(Err(_)) | None => None,
+        };
 
-        this.update(cx, |this, cx| this.set_nodes(nodes, go_packages, cx))
+        this.update_in(cx, |this, window, cx| {
+            this.set_files(files, go_packages, symbols, window, cx)
+        })
+    }
+
+    /// The environment of the project shell, so that `go` is found also when Zed does not start
+    /// from a terminal.
+    fn directory_environment(
+        &self,
+        directory: &Arc<Path>,
+        cx: &mut App,
+    ) -> Shared<Task<Option<HashMap<String, String>>>> {
+        let project_environment = self.project.read(cx).environment().clone();
+        project_environment.update(cx, |environment, cx| {
+            environment.directory_environment(directory.clone(), cx)
+        })
     }
 
     fn go_list(&self, cx: &mut App) -> Task<Result<GoPackages>> {
@@ -357,22 +414,10 @@ impl ReviewCanvas {
         let Some(repository_root) = self.repository_root.clone() else {
             return Task::ready(Err(anyhow!("The repository root is not known")));
         };
-        // The environment of the project shell, so that `go` is found also when Zed does not
-        // start from a terminal.
-        let project_environment = self.project.read(cx).environment().clone();
-        let environment = project_environment.update(cx, |environment, cx| {
-            environment.directory_environment(repository_root.clone(), cx)
-        });
+        let environment = self.directory_environment(&repository_root, cx);
         cx.background_spawn(async move {
             let environment = environment.await;
-            // If the project environment is not available, Zed's own `PATH` is the fallback.
-            let search_path = environment
-                .as_ref()
-                .and_then(|environment| environment.get("PATH"))
-                .map(OsString::from)
-                .or_else(|| std::env::var_os("PATH"));
-            let go = which::which_in("go", search_path, &repository_root)
-                .context("Could not find the `go` command")?;
+            let go = find_go(environment.as_ref(), &repository_root)?;
             let mut command = util::command::new_command(go);
             command
                 .arg("list")
@@ -393,60 +438,155 @@ impl ReviewCanvas {
         })
     }
 
-    fn build_node(
+    /// Runs the `go-review-graph` analyzer on the changed packages and the packages between
+    /// them. `Ok(None)` means that there is nothing to analyze.
+    fn analyze_symbols(
+        &self,
+        files: &[ChangedFile],
+        go_packages: &GoPackages,
+        cx: &mut App,
+    ) -> Task<Result<Option<SymbolGraph>>> {
+        #[cfg(test)]
+        match &self.analyzer_for_tests {
+            AnalyzerForTests::Skip => return Task::ready(Ok(None)),
+            AnalyzerForTests::Real => {}
+        }
+
+        let Some(repository_root) = self.repository_root.clone() else {
+            return Task::ready(Err(anyhow!("The repository root is not known")));
+        };
+        let changed: BTreeSet<String> = files
+            .iter()
+            .filter(|file| file.is_go())
+            .filter_map(|file| go_packages.package_for_file(&file.abs_path))
+            .map(|package| package.id.clone())
+            .collect();
+        let import_paths = go_packages.analysis_import_paths(&changed);
+        if import_paths.is_empty() {
+            return Task::ready(Ok(None));
+        }
+        let environment = self.directory_environment(&repository_root, cx);
+        cx.background_spawn(async move {
+            let environment = environment.await;
+            let go = find_go(environment.as_ref(), &repository_root)?;
+            let analyzer = build_analyzer(&go, &analyzer_directory(), environment.clone()).await?;
+            let mut command = util::command::new_command(analyzer);
+            command
+                .arg(repository_root.as_os_str())
+                .args(&import_paths)
+                .current_dir(&repository_root);
+            if let Some(environment) = environment {
+                command.envs(environment);
+            }
+            let output = command
+                .output()
+                .await
+                .context("Could not run go-review-graph")?;
+            anyhow::ensure!(
+                output.status.success(),
+                "go-review-graph failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            SymbolGraph::parse(&output.stdout).map(Some)
+        })
+    }
+
+    fn load_file(
         &self,
         repo_path: &RepoPath,
         file_status: FileStatus,
         loaded: LoadedDiffBuffer,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<CanvasNode> {
+        cx: &App,
+    ) -> Option<LoadedFile> {
         let LoadedDiffBuffer {
             display_buffer,
             diff,
             ..
         } = loaded;
 
-        let path = repo_path.as_unix_str().to_string();
-        let info = NodeInfo {
-            is_generated: path.ends_with(".go")
-                && is_generated_go_file(&display_buffer.read(cx).text()),
-            abs_path: self
-                .repository_root
-                .as_deref()
-                .map(|root| root.join(repo_path.as_std_path()))
-                .unwrap_or_else(|| repo_path.as_std_path().to_path_buf()),
-            path,
-        };
-
-        let change_block_ranges: Vec<Range<language::Point>> = {
+        let change_blocks: Vec<Range<u32>> = {
             let snapshot = display_buffer.read(cx).snapshot();
             let diff_snapshot = diff.read(cx).snapshot(cx);
             diff_snapshot
                 .hunks(&snapshot)
-                .map(|hunk| hunk.buffer_range.to_point(&snapshot))
+                .map(|hunk| {
+                    let range = hunk.buffer_range.to_point(&snapshot);
+                    let end_row = if range.end.column > 0 {
+                        range.end.row + 1
+                    } else {
+                        range.end.row
+                    };
+                    range.start.row..end_row.max(range.start.row)
+                })
                 .collect()
         };
         // A status change without text change blocks (for example, a mode change) has
         // nothing to review on the canvas.
-        if change_block_ranges.is_empty() {
+        if change_blocks.is_empty() {
             return None;
         }
-        let change_block_count = change_block_ranges.len();
+
+        let path = repo_path.as_unix_str().to_string();
+        let status = if file_status.is_created() {
+            "added"
+        } else if file_status.is_deleted() {
+            "deleted"
+        } else {
+            "modified"
+        };
+        Some(LoadedFile {
+            info: ChangedFile {
+                is_generated: path.ends_with(".go")
+                    && is_generated_go_file(&display_buffer.read(cx).text()),
+                abs_path: self
+                    .repository_root
+                    .as_deref()
+                    .map(|root| root.join(repo_path.as_std_path()))
+                    .unwrap_or_else(|| repo_path.as_std_path().to_path_buf()),
+                path,
+                change_blocks,
+            },
+            status,
+            display_buffer,
+            diff,
+        })
+    }
+
+    fn create_node(
+        &self,
+        node: &ModelNode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<CanvasNode> {
+        let file = self.files.get(node.file)?;
+        let excerpt_ranges: Vec<Range<language::Point>> = {
+            let max_point = file.display_buffer.read(cx).snapshot().max_point();
+            let to_point = |row: u32| {
+                if row > max_point.row {
+                    max_point
+                } else {
+                    language::Point::new(row, 0)
+                }
+            };
+            node.parts
+                .iter()
+                .map(|part| to_point(part.rows.start)..to_point(part.rows.end))
+                .collect()
+        };
 
         let context_lines = multibuffer_context_lines(cx);
         let multibuffer = cx.new(|cx| {
             let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
             multibuffer.set_all_diff_hunks_expanded(cx);
-            let path_key = PathKey::for_buffer(&display_buffer, cx);
+            let path_key = PathKey::for_buffer(&file.display_buffer, cx);
             multibuffer.set_excerpts_for_path(
                 path_key,
-                display_buffer.clone(),
-                change_block_ranges,
+                file.display_buffer.clone(),
+                excerpt_ranges,
                 context_lines,
                 cx,
             );
-            multibuffer.add_diff(diff, cx);
+            multibuffer.add_diff(file.diff.clone(), cx);
             multibuffer
         });
 
@@ -482,74 +622,116 @@ impl ReviewCanvas {
             editor
         });
 
+        let change_block_count = node
+            .parts
+            .iter()
+            .map(|part| part.change_block)
+            .collect::<BTreeSet<_>>()
+            .len();
         let settings = ThemeSettings::get_global(cx);
         let line_height = settings.buffer_font_size(cx) * settings.buffer_line_height.value();
-        let estimated_rows = line_lengths.len() + change_block_count * 2;
+        let estimated_rows = line_lengths.len() + node.parts.len() * 2;
 
-        let status = if file_status.is_created() {
-            "added"
-        } else if file_status.is_deleted() {
-            "deleted"
+        let mut title = vec![file.info.path.clone()];
+        if node.declarations.is_empty() {
+            title.push(file.status.to_string());
         } else {
-            "modified"
-        };
-        let change_blocks = if change_block_count == 1 {
+            title.push(node.declarations.join(", "));
+        }
+        title.push(if change_block_count == 1 {
             "1 change".to_string()
         } else {
             format!("{change_block_count} changes")
-        };
+        });
+        if file.info.is_generated {
+            title.push("generated".to_string());
+        }
 
-        let generated = if info.is_generated {
-            " · generated"
-        } else {
-            ""
-        };
         Some(CanvasNode {
-            title: format!("{} · {status} · {change_blocks}{generated}", info.path).into(),
-            info,
+            title: title.join(" · ").into(),
             editor,
             line_lengths,
             estimated_body_height: line_height * estimated_rows as f32,
         })
     }
 
-    fn set_nodes(
+    fn set_files(
         &mut self,
-        nodes: Vec<CanvasNode>,
-        go_packages: Option<Result<GoPackages>>,
+        files: Vec<LoadedFile>,
+        go_packages: Option<Result<Rc<GoPackages>>>,
+        symbols: Option<Result<Option<SymbolGraph>>>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        *self.body_heights.borrow_mut() = nodes
-            .iter()
-            .map(|node| node.estimated_body_height)
-            .collect();
-        self.nodes = nodes;
-        (self.go_packages, self.graph_warning) = match go_packages {
-            Some(Ok(go_packages)) => (Some(Rc::new(go_packages)), None),
-            Some(Err(error)) => (None, Some(format!("No package graph: {error:#}").into())),
-            None => (None, None),
+        self.files = files;
+        let mut warnings = Vec::new();
+        self.go_packages = match go_packages {
+            Some(Ok(go_packages)) => Some(go_packages),
+            Some(Err(error)) => {
+                warnings.push(format!("No package graph: {error:#}"));
+                None
+            }
+            None => None,
         };
-        self.rebuild_model();
+        self.symbols = match symbols {
+            Some(Ok(symbols)) => {
+                // Type errors can hide uses, so some arrows can be missing.
+                if let Some(symbols) = &symbols
+                    && !symbols.errors.is_empty()
+                {
+                    let count = symbols.errors.len();
+                    let errors = if count == 1 { "error" } else { "errors" };
+                    warnings.push(format!(
+                        "{count} type {errors} in the analyzed packages: some arrows can be missing"
+                    ));
+                }
+                symbols.map(Rc::new)
+            }
+            Some(Err(error)) => {
+                warnings.push(format!("No symbol graph: {error:#}"));
+                None
+            }
+            None => None,
+        };
+        self.graph_warning = (!warnings.is_empty()).then(|| warnings.join("\n").into());
+        // New files need new editors, also when the nodes look the same.
+        self.model = ReviewModel::default();
+        self.nodes.clear();
+        self.rebuild_model(window, cx);
         self.load_state = LoadState::Ready;
-        // The zoom can change while the nodes load.
-        self.apply_zoom_to_editors(cx);
         cx.notify();
     }
 
-    fn rebuild_model(&mut self) {
-        let infos: Vec<NodeInfo> = self.nodes.iter().map(|node| node.info.clone()).collect();
-        let repository_root = self.repository_root.as_deref().unwrap_or(Path::new(""));
-        self.model = ReviewModel::build(
+    /// Builds the model again. The editors stay if the nodes stay the same, for example when
+    /// only the review order changes.
+    fn rebuild_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let infos: Vec<ChangedFile> = self.files.iter().map(|file| file.info.clone()).collect();
+        let repository_root = self.repository_root.clone();
+        let model = ReviewModel::build(
             &infos,
             self.go_packages.as_deref(),
-            repository_root,
+            self.symbols.as_deref(),
+            repository_root.as_deref().unwrap_or(Path::new("")),
             self.order,
         );
+        if model.nodes != self.model.nodes || self.nodes.len() != model.nodes.len() {
+            let nodes: Vec<CanvasNode> = model
+                .nodes
+                .iter()
+                .filter_map(|node| self.create_node(node, window, cx))
+                .collect();
+            *self.body_heights.borrow_mut() = nodes
+                .iter()
+                .map(|node| node.estimated_body_height)
+                .collect();
+            self.nodes = nodes;
+        }
+        self.model = model;
     }
 
-    fn reverse_order(&mut self, cx: &mut Context<Self>) {
+    fn reverse_order(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.order = self.order.reversed();
-        self.rebuild_model();
+        self.rebuild_model(window, cx);
         // Show the start of the new review order.
         self.camera.origin = INITIAL_CAMERA_ORIGIN;
         cx.notify();
@@ -822,12 +1004,14 @@ impl ReviewCanvas {
         index: usize,
         local_bounds: Bounds<Pixels>,
         low_detail: bool,
+        relation: Relation,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let node = self.nodes.get(index)?;
         let zoom = self.camera.zoom();
         let colors = cx.theme().colors();
         let header_height = NODE_HEADER_HEIGHT * zoom;
+        let border_color = Self::relation_color(relation, cx).unwrap_or(colors.border);
 
         let body = if low_detail {
             let line_lengths = node.line_lengths.clone();
@@ -887,8 +1071,11 @@ impl ReviewCanvas {
                 .flex_col()
                 .overflow_hidden()
                 .rounded(px(6.) * zoom)
-                .border_1()
-                .border_color(colors.border)
+                .map(|node| match relation {
+                    Relation::Unrelated => node.border_1(),
+                    Relation::Active | Relation::Dependency | Relation::User => node.border_2(),
+                })
+                .border_color(border_color)
                 .bg(colors.editor_background)
                 .child(
                     div()
@@ -939,7 +1126,7 @@ impl ReviewCanvas {
             .when_some(self.graph_warning.clone(), |status, warning| {
                 status.child(div().text_color(colors.text).child(warning))
             })
-            .when_some(self.render_active_frame_legend(cx), |status, legend| {
+            .when_some(self.render_active_legend(cx), |status, legend| {
                 status.child(legend)
             })
             .child(
@@ -954,14 +1141,19 @@ impl ReviewCanvas {
                     .child(
                         Button::new("reverse-order", "Reverse order")
                             .label_size(LabelSize::XSmall)
-                            .on_click(cx.listener(|this, _, _, cx| this.reverse_order(cx))),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.reverse_order(window, cx)),
+                            ),
                     ),
             )
     }
 
-    fn render_active_frame_legend(&self, cx: &App) -> Option<impl IntoElement> {
-        let active = self.active_frame?;
-        let frame = self.model.frames.get(active)?;
+    fn render_active_legend(&self, cx: &App) -> Option<impl IntoElement> {
+        let active = self.active?;
+        let label = match active {
+            Active::Node(node) => self.nodes.get(node)?.title.clone(),
+            Active::Frame(frame) => self.model.frames.get(frame)?.title.clone(),
+        };
         let edge_relations = self.model.edge_relations(Some(active));
         let count = |relation: Relation| {
             edge_relations
@@ -977,11 +1169,7 @@ impl ReviewCanvas {
         Some(
             h_flex()
                 .gap_2()
-                .child(
-                    div()
-                        .text_color(cx.theme().colors().text)
-                        .child(frame.title.clone()),
-                )
+                .child(div().text_color(cx.theme().colors().text).child(label))
                 .child(entry(Relation::Dependency, "uses"))
                 .child(entry(Relation::User, "used by")),
         )
@@ -998,18 +1186,18 @@ impl ReviewCanvas {
             .into_any_element()
     }
 
-    fn compute_active_frame(&self, window: &Window, cx: &App) -> Option<usize> {
-        let focused_node = self
+    fn compute_active(&self, window: &Window, cx: &App) -> Option<Active> {
+        if let Some(node) = self
             .nodes
             .iter()
-            .position(|node| node.editor.focus_handle(cx).contains_focused(window, cx));
-        match focused_node {
-            Some(node) => self.model.frame_of_node(node),
-            None => self
-                .selected_frame
-                .as_deref()
-                .and_then(|title| self.model.frame_with_title(title)),
+            .position(|node| node.editor.focus_handle(cx).contains_focused(window, cx))
+        {
+            return Some(Active::Node(node));
         }
+        self.selected_frame
+            .as_deref()
+            .and_then(|title| self.model.frame_with_title(title))
+            .map(Active::Frame)
     }
 
     fn relation_color(relation: Relation, cx: &App) -> Option<Hsla> {
@@ -1026,9 +1214,10 @@ impl ReviewCanvas {
         let viewport_size = self.viewport.get().size;
         let culling_bounds = Bounds::new(Point::default(), viewport_size).dilate(CULLING_MARGIN);
         let low_detail = self.screen_font_size(cx) < LOW_DETAIL_FONT_SIZE;
-        self.active_frame = self.compute_active_frame(window, cx);
-        let frame_relations = self.model.frame_relations(self.active_frame);
-        let edge_relations = self.model.edge_relations(self.active_frame);
+        self.active = self.compute_active(window, cx);
+        let frame_relations = self.model.frame_relations(self.active);
+        let node_relations = self.model.node_relations(self.active);
+        let edge_relations = self.model.edge_relations(self.active);
 
         let layout = self.layout();
         let to_local = |bounds: &Bounds<Pixels>| self.camera.to_local_bounds(*bounds);
@@ -1044,27 +1233,30 @@ impl ReviewCanvas {
             .collect();
         self.painted_node_count = visible_nodes.len();
 
-        // With an active frame, the other arrows fade, so that the highlighted ones stand out.
-        let unrelated_arrow_color =
-            cx.theme()
-                .colors()
-                .text_muted
-                .opacity(if self.active_frame.is_some() {
-                    0.2
-                } else {
-                    0.7
-                });
-        let header_middle = FRAME_HEADER_HEIGHT * zoom / 2.;
+        // With an active item, the other arrows fade, so that the highlighted ones stand out.
+        let unrelated_arrow_color = cx
+            .theme()
+            .colors()
+            .text_muted
+            .opacity(if self.active.is_some() { 0.2 } else { 0.7 });
+        let endpoint_anchor = |endpoint: Endpoint| {
+            let bounds = to_local(&layout.endpoint_bounds(endpoint)?);
+            let header_height = match endpoint {
+                Endpoint::Node(_) => NODE_HEADER_HEIGHT,
+                Endpoint::Frame(_) => FRAME_HEADER_HEIGHT,
+            };
+            Some((bounds, bounds.top() + header_height * zoom / 2.))
+        };
         let (highlighted_arrows, other_arrows): (Vec<Arrow>, Vec<Arrow>) = self
             .model
             .edges
             .iter()
             .zip(&edge_relations)
             .filter_map(|(edge, relation)| {
-                let from = frame_bounds.get(edge.from)?;
-                let to = frame_bounds.get(edge.to)?;
-                let start = point(from.right(), from.top() + header_middle);
-                let end = point(to.left(), to.top() + header_middle);
+                let (from, from_y) = endpoint_anchor(edge.from)?;
+                let (to, to_y) = endpoint_anchor(edge.to)?;
+                let start = point(from.right(), from_y);
+                let end = point(to.left(), to_y);
                 let span = Bounds::from_corners(
                     point(start.x.min(end.x), start.y.min(end.y)),
                     point(start.x.max(end.x), start.y.max(end.y)),
@@ -1120,7 +1312,11 @@ impl ReviewCanvas {
             .iter()
             .filter_map(|index| {
                 let bounds = *node_bounds.get(*index)?;
-                self.render_node(*index, bounds, low_detail, cx)
+                let relation = node_relations
+                    .get(*index)
+                    .copied()
+                    .unwrap_or(Relation::Unrelated);
+                self.render_node(*index, bounds, low_detail, relation, cx)
             })
             .collect();
 
@@ -1193,7 +1389,7 @@ impl ReviewCanvas {
 impl Render for ReviewCanvas {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.painted_node_count = 0;
-        self.active_frame = None;
+        self.active = None;
         let content = match &self.load_state {
             LoadState::Loading => self.render_message("Loading changes…".into(), cx),
             LoadState::Failed(message) => self.render_message(message.clone(), cx),
@@ -1215,7 +1411,9 @@ impl Render for ReviewCanvas {
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom_by_steps(-1, None, cx)))
             .on_action(cx.listener(|this, _: &ResetZoom, _, cx| this.set_zoom_step(0, None, cx)))
             .on_action(cx.listener(|this, _: &ZoomToFit, _, cx| this.zoom_to_fit(cx)))
-            .on_action(cx.listener(|this, _: &ReverseOrder, _, cx| this.reverse_order(cx)))
+            .on_action(
+                cx.listener(|this, _: &ReverseOrder, window, cx| this.reverse_order(window, cx)),
+            )
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .child(content)
@@ -1243,6 +1441,79 @@ impl Item for ReviewCanvas {
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
         Some(Icon::new(IconName::Diff).color(Color::Muted))
     }
+}
+
+/// Finds `go` on the `PATH` of the project environment. If this environment is not available,
+/// Zed's own `PATH` is the fallback.
+fn find_go(environment: Option<&HashMap<String, String>>, directory: &Path) -> Result<PathBuf> {
+    let search_path = environment
+        .and_then(|environment| environment.get("PATH"))
+        .map(OsString::from)
+        .or_else(|| std::env::var_os("PATH"));
+    which::which_in("go", search_path, directory).context("Could not find the `go` command")
+}
+
+/// The directory for the built analyzer. A change to the analyzer source gives a new directory,
+/// so that an old binary never runs.
+fn analyzer_directory() -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    for (name, contents) in ANALYZER_SOURCES {
+        name.hash(&mut hasher);
+        contents.hash(&mut hasher);
+    }
+    paths::data_dir()
+        .join("review_canvas")
+        .join(format!("go-review-graph-{:016x}", hasher.finish()))
+}
+
+/// Builds the analyzer with the `go` command of the project, if the binary is not there yet.
+/// The first build downloads `golang.org/x/tools` to the Go module cache.
+async fn build_analyzer<I, K, V>(
+    go: &Path,
+    directory: &Path,
+    environment: Option<I>,
+) -> Result<PathBuf>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    let binary = directory.join("go-review-graph");
+    if binary.exists() {
+        return Ok(binary);
+    }
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("Could not create {}", directory.display()))?;
+    for (name, contents) in ANALYZER_SOURCES {
+        std::fs::write(directory.join(name), contents)
+            .with_context(|| format!("Could not write the analyzer source {name}"))?;
+    }
+    // Two canvases can build at the same time. A temporary name for each build, and a rename at
+    // the end, make sure that no one runs a half-written binary.
+    let temporary = directory.join(format!("go-review-graph.{}.tmp", std::process::id()));
+    let mut command = util::command::new_command(go);
+    command
+        .arg("build")
+        .arg("-o")
+        .arg(&temporary)
+        .arg(".")
+        .current_dir(directory);
+    if let Some(environment) = environment {
+        command.envs(environment);
+    }
+    // The analyzer has no vendored modules, so `go` must be able to download them.
+    command.env("GOFLAGS", "-mod=mod");
+    let output = command
+        .output()
+        .await
+        .context("Could not run `go build` for go-review-graph")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Building go-review-graph failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    std::fs::rename(&temporary, &binary).context("Could not install go-review-graph")?;
+    Ok(binary)
 }
 
 /// Go marks generated files with a comment before the package clause:
@@ -1357,6 +1628,44 @@ mod tests {
             })
             .expect("the review canvas is the active item");
         (fs, review_canvas, cx)
+    }
+
+    fn node_path(review_canvas: &ReviewCanvas, node: usize) -> String {
+        review_canvas
+            .model
+            .nodes
+            .get(node)
+            .and_then(|node| review_canvas.files.get(node.file))
+            .map(|file| file.info.path.clone())
+            .unwrap_or_default()
+    }
+
+    fn endpoint_title(review_canvas: &ReviewCanvas, endpoint: Endpoint) -> String {
+        match endpoint {
+            Endpoint::Node(node) => review_canvas
+                .nodes
+                .get(node)
+                .map(|node| node.title.to_string())
+                .unwrap_or_default(),
+            Endpoint::Frame(frame) => review_canvas
+                .model
+                .frames
+                .get(frame)
+                .map(|frame| frame.title.to_string())
+                .unwrap_or_default(),
+        }
+    }
+
+    fn active_frame_title(review_canvas: &ReviewCanvas) -> Option<String> {
+        let frame = match review_canvas.active? {
+            Active::Node(node) => review_canvas.model.frame_of_node(node)?,
+            Active::Frame(frame) => frame,
+        };
+        review_canvas
+            .model
+            .frames
+            .get(frame)
+            .map(|frame| frame.title.to_string())
     }
 
     fn node_paths(review_canvas: &Entity<ReviewCanvas>, cx: &mut VisualTestContext) -> Vec<String> {
@@ -1549,8 +1858,8 @@ mod tests {
                 .iter()
                 .map(|edge| {
                     (
-                        review_canvas.model.frames[edge.from].title.to_string(),
-                        review_canvas.model.frames[edge.to].title.to_string(),
+                        endpoint_title(review_canvas, edge.from),
+                        endpoint_title(review_canvas, edge.to),
                     )
                 })
                 .collect();
@@ -1558,7 +1867,7 @@ mod tests {
                 .model
                 .other_files
                 .iter()
-                .map(|node| review_canvas.nodes[*node].info.path.clone())
+                .map(|node| node_path(review_canvas, *node))
                 .collect();
             (frames, edges, other_files)
         };
@@ -1581,30 +1890,22 @@ mod tests {
         });
 
         let catalog_editor = review_canvas.read_with(cx, |review_canvas, _| {
-            review_canvas
-                .nodes
-                .iter()
-                .find(|node| node.info.path == "internal/catalog/catalog.go")
+            (0..review_canvas.nodes.len())
+                .find(|node| node_path(review_canvas, *node) == "internal/catalog/catalog.go")
+                .and_then(|node| review_canvas.nodes.get(node))
                 .map(|node| node.editor.clone())
                 .expect("catalog.go has a node")
         });
         cx.update(|window, cx| catalog_editor.focus_handle(cx).focus(window, cx));
         draw(cx);
-        let active_title = |review_canvas: &ReviewCanvas| {
-            review_canvas
-                .active_frame
-                .and_then(|frame| review_canvas.model.frames.get(frame))
-                .map(|frame| frame.title.to_string())
-        };
+        let active_title = active_frame_title;
         review_canvas.read_with(cx, |review_canvas, _| {
             assert_eq!(
                 active_title(review_canvas).as_deref(),
                 Some("internal/catalog")
             );
             assert_eq!(
-                review_canvas
-                    .model
-                    .edge_relations(review_canvas.active_frame),
+                review_canvas.model.edge_relations(review_canvas.active),
                 [Relation::Dependency]
             );
         });
@@ -1617,9 +1918,7 @@ mod tests {
                 Some("internal/catalog")
             );
             assert_eq!(
-                review_canvas
-                    .model
-                    .edge_relations(review_canvas.active_frame),
+                review_canvas.model.edge_relations(review_canvas.active),
                 [Relation::Dependency],
                 "the relation keeps its meaning in the reversed order"
             );
@@ -1651,9 +1950,7 @@ mod tests {
                 Some("internal/money")
             );
             assert_eq!(
-                review_canvas
-                    .model
-                    .edge_relations(review_canvas.active_frame),
+                review_canvas.model.edge_relations(review_canvas.active),
                 [Relation::User]
             );
         });
@@ -1664,7 +1961,7 @@ mod tests {
         });
         draw(cx);
         review_canvas.read_with(cx, |review_canvas, _| {
-            assert_eq!(review_canvas.active_frame, None);
+            assert_eq!(review_canvas.active, None);
         });
     }
 
@@ -1836,13 +2133,15 @@ mod tests {
             .expect("the review canvas is the active item");
         review_canvas.update(cx, |review_canvas, _| {
             review_canvas.go_list_output_for_tests = None;
+            review_canvas.analyzer_for_tests = AnalyzerForTests::Real;
         });
 
         let is_complete = |review_canvas: &ReviewCanvas| {
             review_canvas.load_state != LoadState::Loading
-                && (review_canvas.go_packages.is_some() || review_canvas.graph_warning.is_some())
+                && (review_canvas.symbols.is_some() || review_canvas.graph_warning.is_some())
         };
-        for _ in 0..400 {
+        // The first run builds the analyzer, which can take a while.
+        for _ in 0..1200 {
             draw(cx);
             if review_canvas.read_with(cx, |review_canvas, _| is_complete(review_canvas)) {
                 break;
@@ -1855,7 +2154,11 @@ mod tests {
             assert_eq!(review_canvas.load_state, LoadState::Ready);
             assert_eq!(review_canvas.base_ref.as_deref(), Some("origin/main"));
             assert_eq!(review_canvas.graph_warning, None);
-            assert_eq!(review_canvas.nodes.len(), 16);
+            assert_eq!(review_canvas.files.len(), 16);
+            assert!(
+                review_canvas.nodes.len() > 16,
+                "files split into declaration nodes"
+            );
 
             let frames: Vec<(String, usize)> = review_canvas
                 .model
@@ -1877,15 +2180,44 @@ mod tests {
                 ]
                 .map(|(title, column)| (title.to_string(), column))
             );
-            assert_eq!(review_canvas.model.edges.len(), 7);
             assert_eq!(review_canvas.model.other_files.len(), 3);
 
-            for node in &review_canvas.nodes {
+            let edges: Vec<(String, String)> = review_canvas
+                .model
+                .edges
+                .iter()
+                .map(|edge| {
+                    assert!(
+                        matches!(edge.user, Endpoint::Node(_)),
+                        "symbol arrows connect nodes"
+                    );
+                    (
+                        endpoint_title(review_canvas, edge.user),
+                        endpoint_title(review_canvas, edge.dependency),
+                    )
+                })
+                .collect();
+            for (user, dependency) in [
+                ("applyCode", "Discount"),
+                ("Place", "applyCode"),
+                ("Place", "Product"),
+                ("ServeHTTP", "ChargeWithRetry"),
+                ("TestUnknownCode", "Place"),
+            ] {
+                assert!(
+                    edges.iter().any(|(edge_user, edge_dependency)| {
+                        edge_user.contains(user) && edge_dependency.contains(dependency)
+                    }),
+                    "missing {user} -> {dependency} in {edges:#?}"
+                );
+            }
+
+            for (index, node) in review_canvas.nodes.iter().enumerate() {
                 let snapshot = node.editor.read(cx).buffer().read(cx).snapshot(cx);
                 assert!(
                     snapshot.diff_hunks().next().is_some(),
                     "{} shows no diff",
-                    node.info.path
+                    node_path(review_canvas, index)
                 );
             }
         });

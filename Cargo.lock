@@ -15337,6 +15337,8 @@ name = "review_canvas"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "buffer_diff",
+ "collections",
  "editor",
  "fs",
  "futures 0.3.34",
@@ -15345,6 +15347,7 @@ dependencies = [
  "gpui",
  "language",
  "multi_buffer",
+ "paths",
  "project",
  "serde",
  "serde_json",

@@ -1,0 +1,580 @@
+{
+ "packages": [
+  {
+   "id": "example.com/shop/api",
+   "is_external_test": false,
+   "declarations": [
+    {
+     "id": "example.com/shop/api.Server",
+     "name": "Server",
+     "kind": "type",
+     "file": "/project/api/api.go",
+     "start_line": 15,
+     "end_line": 20,
+     "uses": [
+      "example.com/shop/internal/inventory.Store",
+      "example.com/shop/internal/notify.Notifier",
+      "example.com/shop/internal/payments.Gateway"
+     ]
+    },
+    {
+     "id": "example.com/shop/api.placeOrderRequest",
+     "name": "placeOrderRequest",
+     "kind": "type",
+     "file": "/project/api/api.go",
+     "start_line": 22,
+     "end_line": 26,
+     "uses": [
+      "example.com/shop/internal/orders.Code",
+      "example.com/shop/internal/orders.Item"
+     ]
+    },
+    {
+     "id": "example.com/shop/api.Server.ServeHTTP",
+     "name": "Server.ServeHTTP",
+     "kind": "method",
+     "file": "/project/api/api.go",
+     "start_line": 28,
+     "end_line": 46,
+     "uses": [
+      "example.com/shop/api.Server",
+      "example.com/shop/api.confirmation",
+      "example.com/shop/api.placeOrderRequest",
+      "example.com/shop/internal/notify.Notifier",
+      "example.com/shop/internal/orders.Order",
+      "example.com/shop/internal/orders.Place",
+      "example.com/shop/internal/payments.ChargeWithRetry"
+     ]
+    },
+    {
+     "id": "example.com/shop/api.confirmation",
+     "name": "confirmation",
+     "kind": "func",
+     "file": "/project/api/api.go",
+     "start_line": 48,
+     "end_line": 53,
+     "uses": [
+      "example.com/shop/internal/orders.Order"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "example.com/shop/internal/catalog",
+   "is_external_test": false,
+   "declarations": [
+    {
+     "id": "example.com/shop/internal/catalog.Product",
+     "name": "Product",
+     "kind": "type",
+     "file": "/project/internal/catalog/catalog.go",
+     "start_line": 6,
+     "end_line": 12,
+     "uses": [
+      "example.com/shop/internal/catalog.Category",
+      "example.com/shop/internal/money.Amount"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/catalog.Catalog",
+     "name": "Catalog",
+     "kind": "type",
+     "file": "/project/internal/catalog/catalog.go",
+     "start_line": 14,
+     "end_line": 15,
+     "uses": [
+      "example.com/shop/internal/catalog.Product"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/catalog.Catalog.Lookup",
+     "name": "Catalog.Lookup",
+     "kind": "method",
+     "file": "/project/internal/catalog/catalog.go",
+     "start_line": 17,
+     "end_line": 21,
+     "uses": [
+      "example.com/shop/internal/catalog.Catalog",
+      "example.com/shop/internal/catalog.Product"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/catalog.Default",
+     "name": "Default",
+     "kind": "func",
+     "file": "/project/internal/catalog/catalog.go",
+     "start_line": 23,
+     "end_line": 30,
+     "uses": [
+      "example.com/shop/internal/catalog.Catalog",
+      "example.com/shop/internal/catalog.Drinks",
+      "example.com/shop/internal/catalog.Kitchen",
+      "example.com/shop/internal/catalog.Product"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/catalog.Category",
+     "name": "Category",
+     "kind": "type",
+     "file": "/project/internal/catalog/category.go",
+     "start_line": 5,
+     "end_line": 6,
+     "uses": []
+    },
+    {
+     "id": "example.com/shop/internal/catalog.Drinks",
+     "name": "Drinks",
+     "kind": "const",
+     "file": "/project/internal/catalog/category.go",
+     "start_line": 10,
+     "end_line": 10,
+     "uses": [
+      "example.com/shop/internal/catalog.Category"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/catalog.Kitchen",
+     "name": "Kitchen",
+     "kind": "const",
+     "file": "/project/internal/catalog/category.go",
+     "start_line": 11,
+     "end_line": 11,
+     "uses": [
+      "example.com/shop/internal/catalog.Category"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/catalog.Catalog.InCategory",
+     "name": "Catalog.InCategory",
+     "kind": "method",
+     "file": "/project/internal/catalog/category.go",
+     "start_line": 14,
+     "end_line": 24,
+     "uses": [
+      "example.com/shop/internal/catalog.Catalog",
+      "example.com/shop/internal/catalog.Category",
+      "example.com/shop/internal/catalog.Product"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "example.com/shop/internal/inventory",
+   "is_external_test": false,
+   "declarations": [
+    {
+     "id": "example.com/shop/internal/inventory.Store",
+     "name": "Store",
+     "kind": "type",
+     "file": "/project/internal/inventory/inventory.go",
+     "start_line": 10,
+     "end_line": 14,
+     "uses": [
+      "example.com/shop/internal/catalog.Catalog"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/inventory.New",
+     "name": "New",
+     "kind": "func",
+     "file": "/project/internal/inventory/inventory.go",
+     "start_line": 16,
+     "end_line": 19,
+     "uses": [
+      "example.com/shop/internal/catalog.Catalog",
+      "example.com/shop/internal/inventory.Store"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/inventory.Store.Reserve",
+     "name": "Store.Reserve",
+     "kind": "method",
+     "file": "/project/internal/inventory/inventory.go",
+     "start_line": 21,
+     "end_line": 32,
+     "uses": [
+      "example.com/shop/internal/catalog.Catalog.Lookup",
+      "example.com/shop/internal/catalog.Product",
+      "example.com/shop/internal/inventory.Store"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "example.com/shop/internal/money",
+   "is_external_test": false,
+   "declarations": [
+    {
+     "id": "example.com/shop/internal/money.Amount",
+     "name": "Amount",
+     "kind": "type",
+     "file": "/project/internal/money/money.go",
+     "start_line": 6,
+     "end_line": 7,
+     "uses": []
+    },
+    {
+     "id": "example.com/shop/internal/money.Amount.String",
+     "name": "Amount.String",
+     "kind": "method",
+     "file": "/project/internal/money/money.go",
+     "start_line": 9,
+     "end_line": 12,
+     "uses": [
+      "example.com/shop/internal/money.Amount"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/money.Sum",
+     "name": "Sum",
+     "kind": "func",
+     "file": "/project/internal/money/money.go",
+     "start_line": 14,
+     "end_line": 21,
+     "uses": [
+      "example.com/shop/internal/money.Amount"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/money.Times",
+     "name": "Times",
+     "kind": "func",
+     "file": "/project/internal/money/money.go",
+     "start_line": 23,
+     "end_line": 26,
+     "uses": [
+      "example.com/shop/internal/money.Amount"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/money.Percent",
+     "name": "Percent",
+     "kind": "type",
+     "file": "/project/internal/money/money.go",
+     "start_line": 28,
+     "end_line": 29,
+     "uses": []
+    },
+    {
+     "id": "example.com/shop/internal/money.Discount",
+     "name": "Discount",
+     "kind": "func",
+     "file": "/project/internal/money/money.go",
+     "start_line": 31,
+     "end_line": 34,
+     "uses": [
+      "example.com/shop/internal/money.Amount",
+      "example.com/shop/internal/money.Percent"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/money.TestDiscount",
+     "name": "TestDiscount",
+     "kind": "func",
+     "file": "/project/internal/money/money_test.go",
+     "start_line": 5,
+     "end_line": 12,
+     "uses": [
+      "example.com/shop/internal/money.Discount"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "example.com/shop/internal/notify",
+   "is_external_test": false,
+   "declarations": [
+    {
+     "id": "example.com/shop/internal/notify.Notifier",
+     "name": "Notifier",
+     "kind": "type",
+     "file": "/project/internal/notify/notify.go",
+     "start_line": 10,
+     "end_line": 13,
+     "uses": []
+    },
+    {
+     "id": "example.com/shop/internal/notify.Log",
+     "name": "Log",
+     "kind": "type",
+     "file": "/project/internal/notify/notify.go",
+     "start_line": 15,
+     "end_line": 16,
+     "uses": []
+    },
+    {
+     "id": "example.com/shop/internal/notify.Log.Notify",
+     "name": "Log.Notify",
+     "kind": "method",
+     "file": "/project/internal/notify/notify.go",
+     "start_line": 18,
+     "end_line": 21,
+     "uses": [
+      "example.com/shop/internal/notify.Log"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/notify.Email",
+     "name": "Email",
+     "kind": "type",
+     "file": "/project/internal/notify/notify.go",
+     "start_line": 23,
+     "end_line": 27,
+     "uses": []
+    },
+    {
+     "id": "example.com/shop/internal/notify.Email.Notify",
+     "name": "Email.Notify",
+     "kind": "method",
+     "file": "/project/internal/notify/notify.go",
+     "start_line": 29,
+     "end_line": 32,
+     "uses": [
+      "example.com/shop/internal/notify.Email"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "example.com/shop/internal/orders",
+   "is_external_test": false,
+   "declarations": [
+    {
+     "id": "example.com/shop/internal/orders.Code",
+     "name": "Code",
+     "kind": "type",
+     "file": "/project/internal/orders/discount.go",
+     "start_line": 11,
+     "end_line": 12,
+     "uses": []
+    },
+    {
+     "id": "example.com/shop/internal/orders.applyCode",
+     "name": "applyCode",
+     "kind": "func",
+     "file": "/project/internal/orders/discount.go",
+     "start_line": 14,
+     "end_line": 21,
+     "uses": [
+      "example.com/shop/internal/money.Amount",
+      "example.com/shop/internal/money.Discount",
+      "example.com/shop/internal/orders.Code",
+      "example.com/shop/internal/orders.percentFor"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/orders.percentFor",
+     "name": "percentFor",
+     "kind": "func",
+     "file": "/project/internal/orders/discount.go",
+     "start_line": 23,
+     "end_line": 33,
+     "uses": [
+      "example.com/shop/internal/money.Percent",
+      "example.com/shop/internal/orders.Code",
+      "example.com/shop/internal/orders.discountTable"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/orders.discountTable",
+     "name": "discountTable",
+     "kind": "var",
+     "file": "/project/internal/orders/discount_table_gen.go",
+     "start_line": 7,
+     "end_line": 11,
+     "uses": [
+      "example.com/shop/internal/money.Percent",
+      "example.com/shop/internal/orders.Code"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/orders.Item",
+     "name": "Item",
+     "kind": "type",
+     "file": "/project/internal/orders/orders.go",
+     "start_line": 10,
+     "end_line": 14,
+     "uses": []
+    },
+    {
+     "id": "example.com/shop/internal/orders.Order",
+     "name": "Order",
+     "kind": "type",
+     "file": "/project/internal/orders/orders.go",
+     "start_line": 16,
+     "end_line": 21,
+     "uses": [
+      "example.com/shop/internal/money.Amount",
+      "example.com/shop/internal/orders.Code",
+      "example.com/shop/internal/orders.Item"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/orders.Place",
+     "name": "Place",
+     "kind": "func",
+     "file": "/project/internal/orders/orders.go",
+     "start_line": 23,
+     "end_line": 34,
+     "uses": [
+      "example.com/shop/internal/inventory.Store",
+      "example.com/shop/internal/orders.Code",
+      "example.com/shop/internal/orders.Item",
+      "example.com/shop/internal/orders.Order",
+      "example.com/shop/internal/orders.applyCode",
+      "example.com/shop/internal/orders.reserve",
+      "example.com/shop/internal/pricing.Total"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/orders.reserve",
+     "name": "reserve",
+     "kind": "func",
+     "file": "/project/internal/orders/orders.go",
+     "start_line": 36,
+     "end_line": 46,
+     "uses": [
+      "example.com/shop/internal/catalog.Product",
+      "example.com/shop/internal/inventory.Store",
+      "example.com/shop/internal/inventory.Store.Reserve",
+      "example.com/shop/internal/orders.Item",
+      "example.com/shop/internal/pricing.Line"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/orders.TestPlace",
+     "name": "TestPlace",
+     "kind": "func",
+     "file": "/project/internal/orders/orders_test.go",
+     "start_line": 10,
+     "end_line": 19,
+     "uses": [
+      "example.com/shop/internal/catalog.Default",
+      "example.com/shop/internal/inventory.New",
+      "example.com/shop/internal/orders.Item",
+      "example.com/shop/internal/orders.Order",
+      "example.com/shop/internal/orders.Place"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/orders.TestPlaceWithCode",
+     "name": "TestPlaceWithCode",
+     "kind": "func",
+     "file": "/project/internal/orders/orders_test.go",
+     "start_line": 21,
+     "end_line": 30,
+     "uses": [
+      "example.com/shop/internal/catalog.Default",
+      "example.com/shop/internal/inventory.New",
+      "example.com/shop/internal/orders.Item",
+      "example.com/shop/internal/orders.Order",
+      "example.com/shop/internal/orders.Place"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "example.com/shop/internal/orders_test",
+   "is_external_test": true,
+   "declarations": [
+    {
+     "id": "example.com/shop/internal/orders_test.TestUnknownCode",
+     "name": "TestUnknownCode",
+     "kind": "func",
+     "file": "/project/internal/orders/orders_ext_test.go",
+     "start_line": 11,
+     "end_line": 17,
+     "uses": [
+      "example.com/shop/internal/catalog.Default",
+      "example.com/shop/internal/inventory.New",
+      "example.com/shop/internal/orders.Item",
+      "example.com/shop/internal/orders.Place"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "example.com/shop/internal/payments",
+   "is_external_test": false,
+   "declarations": [
+    {
+     "id": "example.com/shop/internal/payments.ErrDeclined",
+     "name": "ErrDeclined",
+     "kind": "var",
+     "file": "/project/internal/payments/payments.go",
+     "start_line": 10,
+     "end_line": 11,
+     "uses": []
+    },
+    {
+     "id": "example.com/shop/internal/payments.Gateway",
+     "name": "Gateway",
+     "kind": "type",
+     "file": "/project/internal/payments/payments.go",
+     "start_line": 13,
+     "end_line": 16,
+     "uses": [
+      "example.com/shop/internal/money.Amount"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/payments.Charge",
+     "name": "Charge",
+     "kind": "func",
+     "file": "/project/internal/payments/payments.go",
+     "start_line": 18,
+     "end_line": 21,
+     "uses": [
+      "example.com/shop/internal/money.Amount",
+      "example.com/shop/internal/payments.Gateway"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/payments.ChargeWithRetry",
+     "name": "ChargeWithRetry",
+     "kind": "func",
+     "file": "/project/internal/payments/payments.go",
+     "start_line": 23,
+     "end_line": 34,
+     "uses": [
+      "example.com/shop/internal/money.Amount",
+      "example.com/shop/internal/payments.ErrDeclined",
+      "example.com/shop/internal/payments.Gateway"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "example.com/shop/internal/pricing",
+   "is_external_test": false,
+   "declarations": [
+    {
+     "id": "example.com/shop/internal/pricing.Line",
+     "name": "Line",
+     "kind": "type",
+     "file": "/project/internal/pricing/pricing.go",
+     "start_line": 6,
+     "end_line": 10,
+     "uses": [
+      "example.com/shop/internal/money.Amount"
+     ]
+    },
+    {
+     "id": "example.com/shop/internal/pricing.Total",
+     "name": "Total",
+     "kind": "func",
+     "file": "/project/internal/pricing/pricing.go",
+     "start_line": 12,
+     "end_line": 19,
+     "uses": [
+      "example.com/shop/internal/money.Amount",
+      "example.com/shop/internal/money.Sum",
+      "example.com/shop/internal/money.Times",
+      "example.com/shop/internal/pricing.Line"
+     ]
+    }
+   ]
+  }
+ ],
+ "errors": []
+}
